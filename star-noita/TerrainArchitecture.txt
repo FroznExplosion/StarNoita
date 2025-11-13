@@ -1,0 +1,938 @@
+# 2D Terraria-Style Terrain Plugin Technical Architecture
+
+## System Overview
+
+This document explains the complete architecture for a 2D block-based terrain system similar to Terraria/Starbound, implemented as a Godot 4.5 GDExtension plugin.
+
+## High-Level Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Godot 4.5 Editor/Game                    │
+├─────────────────────────────────────────────────────────────┤
+│                    GDScript Game Layer                       │
+│  Player Controller │ Inventory │ Crafting │ Combat │ UI     │
+├─────────────────────────────────────────────────────────────┤
+│                 2D Terrain GDExtension Interface             │
+│  Terrain2D Node │ Block Resources │ Liquid System │ Tools   │
+├─────────────────────────────────────────────────────────────┤
+│                    C++ Core Systems (2D)                     │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐     │
+│  │Chunk Grid    │  │Block Physics │  │Liquid Flow   │     │
+│  └──────────────┘  └──────────────┘  └──────────────┘     │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐     │
+│  │Auto-Tiling   │  │2D Lighting   │  │World Gen     │     │
+│  └──────────────┘  └──────────────┘  └──────────────┘     │
+├─────────────────────────────────────────────────────────────┤
+│                     Threading Layer                          │
+│   Main Thread │ Physics Thread │ Generation Thread │ Network │
+├─────────────────────────────────────────────────────────────┤
+│                     Data Layer                               │
+│     2D Chunks │ Tile Atlas │ Light Map │ Liquid Map         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Core Component Details
+
+### 1. 2D World Coordinate System
+
+```cpp
+// Coordinate systems and conversions
+class CoordinateSystem {
+	// World space: Pixel coordinates
+	// Tile space: Block grid coordinates  
+	// Chunk space: Chunk grid coordinates
+	
+	static Vector2i world_to_tile(Vector2 world_pos) {
+		return Vector2i(
+			floor(world_pos.x / TILE_SIZE),
+			floor(world_pos.y / TILE_SIZE)
+		);
+	}
+	
+	static Vector2i tile_to_chunk(Vector2i tile_pos) {
+		return Vector2i(
+			floor(tile_pos.x / float(CHUNK_WIDTH)),
+			floor(tile_pos.y / float(CHUNK_HEIGHT))
+		);
+	}
+	
+	static Vector2i tile_to_local(Vector2i tile_pos) {
+		return Vector2i(
+			tile_pos.x % CHUNK_WIDTH,
+			tile_pos.y % CHUNK_HEIGHT
+		);
+	}
+};
+```
+
+### 2. 2D Chunk Management Architecture
+
+```cpp
+class ChunkGrid {
+	// Active chunks around player
+	struct ViewArea {
+		Vector2i center_chunk;
+		int horizontal_radius;  // Chunks left/right
+		int vertical_radius;    // Chunks up/down
+		
+		Rect2i get_active_bounds() {
+			return Rect2i(
+				center_chunk - Vector2i(horizontal_radius, vertical_radius),
+				Vector2i(horizontal_radius * 2 + 1, vertical_radius * 2 + 1)
+			);
+		}
+	};
+	
+	void update_active_chunks(Vector2 camera_pos, Vector2 screen_size) {
+		// Calculate visible area in tiles
+		Vector2i screen_tiles(
+			ceil(screen_size.x / TILE_SIZE),
+			ceil(screen_size.y / TILE_SIZE)
+		);
+		
+		// Add buffer for smooth loading
+		const int BUFFER_TILES = 16;
+		Rect2i visible_tiles(
+			world_to_tile(camera_pos) - screen_tiles/2 - Vector2i(BUFFER_TILES, BUFFER_TILES),
+			screen_tiles + Vector2i(BUFFER_TILES * 2, BUFFER_TILES * 2)
+		);
+		
+		// Convert to chunk coordinates
+		Vector2i min_chunk = tile_to_chunk(visible_tiles.position);
+		Vector2i max_chunk = tile_to_chunk(visible_tiles.get_end());
+		
+		// Load/unload chunks
+		load_chunk_range(min_chunk, max_chunk);
+		unload_chunks_outside(min_chunk, max_chunk);
+	}
+};
+```
+
+### 3. Block Data Structure (2D Optimized)
+
+```cpp
+// Compact block storage for 2D
+class BlockStorage {
+	// Pack block data efficiently
+	struct PackedBlock {
+		uint16_t type_and_variant;  // 12 bits type, 4 bits variant
+		uint8_t metadata;            // Damage, state, etc.
+		
+		uint16_t get_type() const { return type_and_variant >> 4; }
+		uint8_t get_variant() const { return type_and_variant & 0x0F; }
+	};
+	
+	// Separate arrays for better cache performance
+	struct ChunkData {
+		PackedBlock foreground[CHUNK_WIDTH][CHUNK_HEIGHT];
+		PackedBlock background[CHUNK_WIDTH][CHUNK_HEIGHT];
+		uint8_t lighting[CHUNK_WIDTH][CHUNK_HEIGHT];
+		uint8_t liquid_type[CHUNK_WIDTH][CHUNK_HEIGHT];
+		uint8_t liquid_level[CHUNK_WIDTH][CHUNK_HEIGHT];
+	};
+};
+```
+
+### 4. Auto-Tiling System (47-Tile Pattern)
+
+```cpp
+class AutoTileSystem {
+	// Terraria's 47-tile blending patterns
+    enum BlendPattern : uint8_t {
+        // Single edges (4 patterns)
+        EDGE_TOP    = 0b00000010,
+        EDGE_RIGHT  = 0b00001000,
+        EDGE_BOTTOM = 0b00100000,
+        EDGE_LEFT   = 0b10000000,
+        
+        // Corners only (4 patterns)
+        CORNER_TL = 0b00000001,
+        CORNER_TR = 0b00000100,
+        CORNER_BR = 0b00010000,
+        CORNER_BL = 0b01000000,
+        
+        // Combined patterns (rest of 47)
+        // Stored as bit patterns for neighbor matching
+    };
+    
+    struct TilesetMapping {
+        // Map each pattern to texture coordinates
+        struct PatternUV {
+            Vector2 uv_start;
+            Vector2 uv_size;
+            bool allow_random_variant;
+            uint8_t num_variants;
+        };
+        
+        PatternUV patterns[47];
+        
+        PatternUV get_pattern_uv(uint8_t neighbor_bits) {
+            // Convert 8-bit neighbor pattern to one of 47 tiles
+            int pattern_index = neighbor_bits_to_pattern_index(neighbor_bits);
+            
+            // Add random variation for supported patterns
+            if (patterns[pattern_index].allow_random_variant) {
+                int variant = rand() % patterns[pattern_index].num_variants;
+                PatternUV result = patterns[pattern_index];
+                result.uv_start.y += variant * result.uv_size.y;
+                return result;
+            }
+            
+            return patterns[pattern_index];
+        }
+    };
+    
+    uint8_t calculate_neighbor_bits(Vector2i pos, int block_type) {
+        uint8_t bits = 0;
+        
+        // Check 8 neighbors clockwise from top-left
+        const Vector2i offsets[8] = {
+            {-1,-1}, {0,-1}, {1,-1},
+            {-1, 0},         {1, 0},
+            {-1, 1}, {0, 1}, {1, 1}
+        };
+        
+        for (int i = 0; i < 8; i++) {
+            Vector2i neighbor = pos + offsets[i];
+            if (should_connect(get_block(neighbor), block_type)) {
+                bits |= (1 << i);
+            }
+        }
+        
+        return bits;
+    }
+};
+```
+
+### 5. 2D Liquid Simulation Architecture
+
+```cpp
+class LiquidSimulation2D {
+    // Cellular automaton for liquid flow
+    struct LiquidProcessor {
+        // Process liquid in horizontal strips for better cache usage
+        void process_strip(int y_start, int y_end) {
+            for (int y = y_start; y < y_end; y++) {
+                for (int x = 0; x < WORLD_WIDTH; x++) {
+                    process_liquid_cell(x, y);
+                }
+            }
+        }
+        
+        void process_liquid_cell(int x, int y) {
+            float current_level = get_liquid_level(x, y);
+            if (current_level < MIN_LIQUID) return;
+            
+            // Step 1: Try to flow down (gravity)
+            float below_capacity = MAX_LIQUID - get_liquid_level(x, y + 1);
+            if (below_capacity > 0 && !is_solid(x, y + 1)) {
+                float flow = min(current_level, min(below_capacity, FLOW_SPEED));
+                transfer_liquid(x, y, x, y + 1, flow);
+                current_level -= flow;
+            }
+            
+            // Step 2: Equalize with sides (pressure)
+            if (current_level > MIN_LIQUID) {
+                equalize_horizontal(x, y, current_level);
+            }
+            
+            // Step 3: Handle compression (Starbound-style)
+            if (current_level > MAX_LIQUID) {
+                // Allow over-pressure, forcing upward flow
+                try_flow_up(x, y, current_level - MAX_LIQUID);
+            }
+        }
+        
+        void equalize_horizontal(int x, int y, float level) {
+            float left_level = get_liquid_level(x - 1, y);
+            float right_level = get_liquid_level(x + 1, y);
+            
+            // Calculate pressure differential
+            float avg = (level + left_level + right_level) / 3.0f;
+            
+            // Flow towards equilibrium
+            if (!is_solid(x - 1, y)) {
+                transfer_liquid(x, y, x - 1, y, (level - avg) * 0.5f);
+            }
+            if (!is_solid(x + 1, y)) {
+                transfer_liquid(x, y, x + 1, y, (level - avg) * 0.5f);
+            }
+        }
+    };
+    
+    // Rain system
+    void apply_rain_strip(int x_start, int x_end, float intensity) {
+        for (int x = x_start; x < x_end; x++) {
+            // Find surface
+            int surface_y = find_surface_at(x);
+            
+            // Add water
+            add_liquid(x, surface_y, WATER, intensity * RAIN_RATE);
+            
+            // Create puddles in depressions
+            if (is_depression(x, surface_y)) {
+                add_liquid(x, surface_y, WATER, intensity * RAIN_RATE * 2);
+            }
+        }
+    }
+    
+    // Evaporation based on biome
+    void process_evaporation(float delta_time) {
+        for (auto& [pos, liquid] : active_liquids) {
+            if (liquid.type != WATER) continue;
+            
+            BiomeType biome = get_biome(pos);
+            float evap_rate = EVAPORATION_RATES[biome];
+            
+            // Shallow water evaporates faster
+            if (liquid.level < 0.3f) {
+                evap_rate *= 2.0f;
+            }
+            
+            // Large bodies evaporate slower
+            int connected_cells = count_connected_liquid(pos);
+            if (connected_cells > 100) {
+                evap_rate *= 0.5f;
+            }
+            
+            liquid.level -= evap_rate * delta_time;
+        }
+    }
+};
+```
+
+### 6. 2D Physics Pipeline
+
+```cpp
+class Physics2D {
+    struct PhysicsUpdate {
+        // Process physics in this order
+        void update(float delta) {
+            // 1. Update falling entities (sand, items)
+            update_falling_blocks(delta);
+            
+            // 2. Check block support
+            check_structural_integrity();
+            
+            // 3. Process explosions
+            process_queued_explosions();
+            
+            // 4. Update liquid
+            liquid_system.update(delta);
+            
+            // 5. Entity collisions
+            resolve_entity_collisions();
+        }
+        
+        void update_falling_blocks(float delta) {
+            for (auto& block : falling_blocks) {
+                // Apply gravity
+                block.velocity.y += GRAVITY * delta;
+                
+                // Terminal velocity
+                block.velocity.y = min(block.velocity.y, MAX_FALL_SPEED);
+                
+                // Move and check collision
+                Vector2 new_pos = block.position + block.velocity * delta;
+                
+                if (check_collision(new_pos)) {
+                    // Settle or break
+                    if (block.velocity.y > BREAK_THRESHOLD) {
+                        spawn_item_drops(block);
+                    } else {
+                        place_block_at(world_to_tile(new_pos), block.type);
+                    }
+                    remove_falling_block(block);
+                } else {
+                    block.position = new_pos;
+                }
+            }
+        }
+        
+        void check_structural_integrity() {
+            // Check multi-block structures
+            for (auto& structure : multi_block_structures) {
+                if (!has_adequate_support(structure)) {
+                    collapse_structure(structure);
+                }
+            }
+            
+            // Check platforms and bridges
+            for (auto& platform : platforms) {
+                int max_unsupported = MATERIALS[platform.material].max_span;
+                if (get_unsupported_length(platform) > max_unsupported) {
+                    break_platform(platform);
+                }
+            }
+        }
+    };
+};
+```
+
+### 7. 2D Rendering Pipeline
+
+```cpp
+class Renderer2D {
+    // Layer-based rendering for proper depth
+    enum RenderLayer {
+        BACKGROUND_FAR,   // Parallax background
+        BACKGROUND_WALLS, // Wall tiles
+        LIQUIDS_BACK,     // Liquid behind blocks
+        BLOCKS,           // Main tile layer
+        LIQUIDS_FRONT,    // Liquid in front
+        ENTITIES,         // Players, enemies, items
+        PARTICLES,        // Effects
+        LIGHTING,         // Light overlay
+        UI                // Interface
+    };
+    
+    void render_frame(Camera2D camera) {
+        // Calculate visible bounds
+        Rect2 view = calculate_view_bounds(camera);
+        
+        // Render each layer in order
+        render_parallax_background(view, BACKGROUND_FAR);
+        render_tiles(view, BACKGROUND_WALLS, 0.6f);  // Darker
+        render_liquid(view, LIQUIDS_BACK);
+        render_tiles(view, BLOCKS, 1.0f);
+        render_liquid(view, LIQUIDS_FRONT, 0.8f);
+        render_entities(view);
+        render_particles(view);
+        apply_lighting(view);
+        render_ui();
+    }
+    
+    void render_tiles(Rect2 view, RenderLayer layer, float brightness) {
+        // Batch tiles by texture
+        std::unordered_map<TextureID, std::vector<TileInstance>> batches;
+        
+        // Gather visible tiles
+        Vector2i min_tile = world_to_tile(view.position);
+        Vector2i max_tile = world_to_tile(view.get_end());
+        
+        for (int x = min_tile.x; x <= max_tile.x; x++) {
+            for (int y = min_tile.y; y <= max_tile.y; y++) {
+                Block2D block = get_block(x, y, layer == BACKGROUND_WALLS);
+                
+                if (block.id == AIR) continue;
+                
+                TileInstance instance;
+                instance.position = Vector2(x * TILE_SIZE, y * TILE_SIZE);
+                
+                // Apply auto-tiling
+                if (block.supports_blend) {
+                    uint8_t pattern = calculate_blend_pattern(x, y, block.id);
+                    instance.uv = get_pattern_uv(pattern);
+                } else {
+                    instance.uv = get_simple_tile_uv(block.id);
+                }
+                
+                // Apply lighting
+                float light = get_light_at(x, y);
+                instance.color = Color(light * brightness);
+                
+                batches[block.texture_id].push_back(instance);
+            }
+        }
+        
+        // Render batches
+        for (auto& [texture, instances] : batches) {
+            render_instanced_tiles(texture, instances);
+        }
+    }
+};
+```
+
+### 8. 2D Lighting System
+
+```cpp
+class LightingSystem2D {
+    // Light propagation for 2D
+    struct LightMap {
+        // Store light as 0-255 for memory efficiency
+        uint8_t light_level[WORLD_WIDTH][WORLD_HEIGHT];
+        
+        // Separate color channels for colored light
+        uint8_t light_r[WORLD_WIDTH][WORLD_HEIGHT];
+        uint8_t light_g[WORLD_WIDTH][WORLD_HEIGHT];
+        uint8_t light_b[WORLD_WIDTH][WORLD_HEIGHT];
+    };
+    
+    void calculate_lighting() {
+        // Reset to ambient
+        reset_to_ambient();
+        
+        // Apply sunlight from top
+        for (int x = 0; x < WORLD_WIDTH; x++) {
+            apply_sunlight_column(x);
+        }
+        
+        // Add point lights
+        for (auto& light : light_sources) {
+            propagate_light(light.pos, light.intensity, light.color);
+        }
+        
+        // Smooth for better appearance
+        smooth_lighting();
+    }
+    
+    void apply_sunlight_column(int x) {
+        float intensity = get_time_of_day_brightness();
+        
+        for (int y = 0; y < WORLD_HEIGHT; y++) {
+            Block2D block = get_block(x, y);
+            
+            // Reduce light by block opacity
+            intensity *= (1.0f - block.opacity);
+            
+            set_light(x, y, intensity);
+            
+            // Stop when too dark
+            if (intensity < 0.01f) break;
+        }
+    }
+    
+    void propagate_light(Vector2i source, float intensity, Color color) {
+        // Dijkstra-style propagation
+        std::priority_queue<LightNode> queue;
+        queue.push({source, intensity});
+        
+        while (!queue.empty()) {
+            auto node = queue.top();
+            queue.pop();
+            
+            if (node.intensity < 0.01f) continue;
+            
+            // Spread to neighbors
+            for (auto& offset : CARDINAL_DIRECTIONS) {
+                Vector2i next = node.pos + offset;
+                Block2D block = get_block(next);
+                
+                float new_intensity = node.intensity * (1.0f - block.opacity) * 0.9f;
+                
+                if (new_intensity > get_light(next)) {
+                    set_light(next, new_intensity, color);
+                    queue.push({next, new_intensity});
+                }
+            }
+        }
+    }
+};
+```
+
+### 9. Networking Architecture (Player Hosting)
+
+```cpp
+class NetworkSystem {
+    // Host-authoritative model
+    class HostServer {
+        std::vector<ClientConnection> clients;
+        WorldState authoritative_state;
+        
+        void handle_client_action(ClientID client, Action action) {
+            // Validate action
+            if (!validate_action(client, action)) {
+                send_correction(client);
+                return;
+            }
+            
+            // Apply to world
+            apply_action(action);
+            
+            // Broadcast to other clients
+            for (auto& other : clients) {
+                if (other.id != client) {
+                    send_action(other, action);
+                }
+            }
+        }
+        
+        void sync_chunk(ClientID client, Vector2i chunk_pos) {
+            // Compress chunk data
+            auto compressed = compress_chunk(get_chunk(chunk_pos));
+            
+            // Send in packets if large
+            const size_t MAX_PACKET = 1024;
+            for (size_t offset = 0; offset < compressed.size(); offset += MAX_PACKET) {
+                send_chunk_packet(client, chunk_pos, compressed, offset);
+            }
+        }
+    };
+    
+    // Client prediction
+    class GameClient {
+        void predict_action(Action action) {
+            // Apply locally immediately
+            apply_local_prediction(action);
+            
+            // Send to host
+            send_to_host(action);
+            
+            // Store for rollback if needed
+            pending_predictions.push(action);
+        }
+        
+        void receive_authoritative_update(WorldUpdate update) {
+            // Check predictions
+            while (!pending_predictions.empty()) {
+                auto prediction = pending_predictions.front();
+                
+                if (update.confirms(prediction)) {
+                    // Prediction was correct
+                    pending_predictions.pop();
+                } else {
+                    // Rollback and replay
+                    rollback_to(update.timestamp);
+                    apply_update(update);
+                    replay_predictions_from(update.timestamp);
+                    break;
+                }
+            }
+        }
+    };
+};
+```
+
+### 10. Multi-Size Block System
+
+```cpp
+class MultiBlockSystem {
+    // Handle blocks larger than 1x1
+    struct MultiBlock {
+        Vector2i origin;      // Top-left tile
+        Vector2i size;        // Size in tiles
+        int block_type;
+        
+        // Check if any part is at position
+        bool contains(Vector2i pos) {
+            return pos.x >= origin.x && pos.x < origin.x + size.x &&
+                   pos.y >= origin.y && pos.y < origin.y + size.y;
+        }
+    };
+    
+    void place_multi_block(Vector2i pos, BlockDefinition def) {
+        // Check if area is clear
+        for (int x = 0; x < def.size.x; x++) {
+            for (int y = 0; y < def.size.y; y++) {
+                if (!can_place_at(pos + Vector2i(x, y))) {
+					return; // Can't place
+				}
+			}
+		}
+		
+		// Place anchor block
+		set_block(pos, def.id);
+		
+		// Place reference blocks
+		for (int x = 0; x < def.size.x; x++) {
+			for (int y = 0; y < def.size.y; y++) {
+				if (x == 0 && y == 0) continue;
+				
+				Block2D ref;
+				ref.id = MULTIBLOCK_REFERENCE;
+				ref.metadata = encode_offset(Vector2i(-x, -y));
+				set_block(pos + Vector2i(x, y), ref);
+			}
+		}
+		
+		// Register in multi-block tracker
+		multi_blocks[pos] = MultiBlock{pos, def.size, def.id};
+	}
+	
+	void break_multi_block(Vector2i pos) {
+		// Find origin
+		Vector2i origin = find_multi_block_origin(pos);
+		
+		// Clear all tiles
+		MultiBlock mb = multi_blocks[origin];
+		for (int x = 0; x < mb.size.x; x++) {
+			for (int y = 0; y < mb.size.y; y++) {
+				set_block(origin + Vector2i(x, y), AIR);
+			}
+		}
+		
+		// Drop items
+		spawn_item(origin, mb.block_type);
+		
+		// Remove from tracker
+		multi_blocks.erase(origin);
+	}
+};
+```
+
+### 11. Biome System Integration
+
+```cpp
+class BiomeSystem {
+	struct Biome {
+		String name;
+		float temperature;
+		float humidity;
+		
+		// Block palette
+		int surface_block;
+		int subsurface_block;
+		int stone_block;
+		
+		// Generation parameters
+		float terrain_frequency;
+		float terrain_amplitude;
+		float cave_frequency;
+		
+		// Environmental
+		float evaporation_rate;
+		float rain_frequency;
+		Color ambient_light;
+		
+		// Decorations
+		std::vector<StructureTemplate> structures;
+		std::vector<PlantType> vegetation;
+	};
+	
+	Biome get_biome_at(float world_x) {
+		// Use noise for smooth transitions
+		float temp = temperature_noise.get(world_x * 0.001f);
+		float humidity = humidity_noise.get(world_x * 0.001f + 1000);
+		
+		// Find closest biome
+		return biome_map.get_biome(temp, humidity);
+	}
+	
+	void generate_biome_transition(int x1, int x2, Biome from, Biome to) {
+		float blend_width = 32.0f; // Tiles
+		
+		for (int x = x1; x < x2; x++) {
+			float t = (x - x1) / blend_width;
+			t = smoothstep(0, 1, t);
+			
+			// Blend terrain height
+			float height1 = generate_height(x, from);
+			float height2 = generate_height(x, to);
+			float height = lerp(height1, height2, t);
+			
+			// Blend blocks based on position
+			for (int y = 0; y < WORLD_HEIGHT; y++) {
+				Block2D block;
+				
+				if (randf() < t) {
+					block = generate_block(x, y, to);
+				} else {
+					block = generate_block(x, y, from);
+				}
+				
+				set_block(x, y, block);
+			}
+		}
+	}
+};
+```
+
+### 12. Performance Monitoring
+
+```cpp
+class PerformanceMonitor2D {
+	struct FrameMetrics {
+		// Timing
+		float chunk_generation_ms;
+		float physics_update_ms;
+		float liquid_simulation_ms;
+		float lighting_calculation_ms;
+		float rendering_ms;
+		
+		// Counts
+		int visible_tiles;
+		int active_chunks;
+		int active_liquids;
+		int falling_blocks;
+		int light_sources;
+		
+		// Memory
+		size_t chunk_memory;
+		size_t texture_memory;
+		size_t total_memory;
+	};
+	
+	void update_metrics() {
+		auto metrics = collect_metrics();
+		
+		// Check performance targets
+		if (metrics.visible_tiles > 5000) {
+			log_warning("Too many visible tiles: " + str(metrics.visible_tiles));
+		}
+		
+		if (metrics.rendering_ms > 16.0f) {
+			log_warning("Frame time exceeded: " + str(metrics.rendering_ms));
+		}
+		
+		// Report to Godot
+		Performance::get_singleton()->add_custom_monitor(
+			"terrain_2d/visible_tiles", metrics.visible_tiles
+		);
+		Performance::get_singleton()->add_custom_monitor(
+			"terrain_2d/fps", 1000.0f / get_total_frame_time()
+		);
+	}
+};
+```
+
+## Data Flow Examples
+
+### Block Placement Flow
+```
+1. Player clicks tile position
+2. GDScript handles input → Terrain2D.place_block()
+3. Validate placement (tool, resources, permissions)
+4. Update chunk data
+5. Trigger auto-tiling recalculation for neighbors
+6. Queue physics check (gravity, support)
+7. Update lighting around block
+8. Generate new mesh if needed
+9. Send network update to other players
+10. Play sound/particle effect
+```
+
+### Liquid Flow Cycle (30Hz)
+```
+Every 33ms:
+1. Process all active liquid cells
+2. Apply gravity (flow down)
+3. Calculate pressure differentials
+4. Equalize horizontal levels
+5. Handle overflow (upward pressure)
+6. Check floating objects
+7. Apply evaporation
+8. Update liquid mesh
+9. Mark chunks for re-render
+```
+
+### Chunk Loading Sequence
+```
+1. Player moves → new chunk needed
+2. Check disk cache
+3. If not cached:
+   a. Generate heightmap
+   b. Determine biome
+   c. Place blocks layer by layer
+   d. Generate caves
+   e. Add ores
+   f. Place structures
+4. Build initial mesh
+5. Calculate initial lighting
+6. Add to active chunks
+7. Start physics simulation
+8. Trigger "chunk_loaded" event
+```
+
+## Memory Layout
+
+### Per-Chunk Memory
+```
+Foreground blocks: 32 × 32 × 2 bytes = 2 KB
+Background blocks: 32 × 32 × 2 bytes = 2 KB
+Lighting data:     32 × 32 × 1 byte  = 1 KB
+Liquid data:       32 × 32 × 2 bytes = 2 KB
+Mesh data:         ~4-8 KB (varies)
+Metadata:          ~1 KB
+-------------------
+Total per chunk:   ~12-16 KB
+
+For 100 active chunks: ~1.2-1.6 MB
+```
+
+### Optimization Strategies
+
+1. **Tile Batching**: Group tiles by texture atlas
+2. **Occlusion Culling**: Skip hidden tiles
+3. **LOD System**: Reduce detail at distance
+4. **Dirty Tracking**: Only update changed chunks
+5. **Spatial Indexing**: Fast tile lookups
+6. **Object Pooling**: Reuse chunk/particle objects
+7. **Compression**: Compress inactive chunks
+
+## Integration with Godot Scene Tree
+
+```
+Terrain2D (Node2D)
+├── ChunkContainer (Node2D)
+│   ├── Chunk_0_0 (Node2D)
+│   │   ├── TileMap (for blocks)
+│   │   ├── TileMap (for background)
+│   │   └── Area2D (for triggers)
+│   └── Chunk_1_0 (Node2D)
+│       └── ...
+├── LiquidRenderer (Node2D)
+│   └── MultiMeshInstance2D
+├── LightingCanvas (CanvasModulate)
+├── ParticleContainer (Node2D)
+│   ├── RainParticles (CPUParticles2D)
+│   └── BreakParticles (GPUParticles2D)
+└── NetworkManager (Node)
+```
+
+## Platform-Specific Considerations
+
+### Desktop (Primary Target)
+- Full feature set enabled
+- High chunk view distance
+- Complex shaders for lighting
+- Uncapped particle count
+
+### Mobile (Future)
+- Reduced view distance
+- Simplified lighting (no smooth shadows)
+- Tile count limit (3000)
+- Touch-optimized controls
+- Lower liquid simulation rate
+
+### Web (Future)
+- Progressive chunk loading
+- Compressed textures
+- Simplified physics
+- WebRTC for multiplayer
+
+## Debug Tools
+
+```gdscript
+# Debug overlay options
+@export var show_chunk_borders := false
+@export var show_liquid_levels := false
+@export var show_light_values := false
+@export var show_collision_shapes := false
+@export var show_network_lag := false
+@export var show_performance_stats := true
+```
+
+## Save File Format
+
+```cpp
+struct SaveFile {
+	// Header
+	uint32_t version;
+	uint32_t world_seed;
+	Vector2i world_size;
+	float play_time;
+	
+	// Chunk data (compressed)
+	struct ChunkSave {
+		Vector2i position;
+		uint32_t compressed_size;
+		uint8_t compressed_data[];  // zlib compressed
+	};
+	
+	// Entity data
+	struct EntitySave {
+		String type;
+		Vector2 position;
+		Dictionary properties;
+	};
+	
+	// Player data
+	Vector2 spawn_point;
+	Vector2 player_position;
+	Array inventory;
+	Dictionary stats;
+};
+```
+
+This architecture provides a complete, optimized 2D terrain system that matches Terraria's capabilities while leveraging Godot 4.5's features and modern C++ performance optimizations.

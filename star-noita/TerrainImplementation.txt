@@ -1,0 +1,757 @@
+# 2D Terraria-Style Terrain System Implementation Instructions for Claude Code
+
+## Project Overview
+Create a C++ GDExtension plugin for Godot 4.5 that implements a high-performance 2D block-based terrain system similar to Terraria/Starbound, with advanced physics, liquid simulation, and smooth block blending.
+
+## Core Architecture
+
+### 1. C++ Plugin Structure
+```
+2d_terrain_plugin/
+├── src/
+│   ├── register_types.cpp          # Plugin registration
+│   ├── core/
+│   │   ├── chunk_manager.h/cpp     # Manages 2D chunks
+│   │   ├── block_physics.h/cpp     # 2D block physics
+│   │   ├── liquid_simulation.h/cpp # 2D liquid physics
+│   │   ├── networking_layer.h/cpp  # Multiplayer sync
+│   │   └── block_registry.h/cpp    # Block definitions
+│   ├── world/
+│   │   ├── chunk.h/cpp            # 2D chunk data
+│   │   ├── block.h/cpp            # Block properties
+│   │   ├── world_generator.h/cpp  # 2D terrain generation
+│   │   └── biome_system.h/cpp     # Biome definitions
+│   ├── rendering/
+│   │   ├── tile_renderer.h/cpp    # 2D tile rendering
+│   │   ├── auto_tiling.h/cpp      # Terraria-style blending
+│   │   ├── lighting_system.h/cpp  # 2D lighting
+│   │   └── background_layers.h/cpp # Parallax backgrounds
+│   └── utils/
+│       ├── thread_pool.h/cpp      # Threading utilities
+│       └── grid_hash.h/cpp        # 2D spatial indexing
+├── SConstruct
+└── terrain_2d.gdextension
+```
+
+### 2. Setup Instructions
+
+#### GDExtension Configuration
+Create `terrain_2d.gdextension`:
+```ini
+[configuration]
+entry_symbol = "terrain_2d_library_init"
+compatibility_minimum = "4.1"
+reloadable = true
+
+[libraries]
+windows.debug.x86_64 = "bin/libterrain2d.windows.debug.x86_64.dll"
+windows.release.x86_64 = "bin/libterrain2d.windows.release.x86_64.dll"
+linux.debug.x86_64 = "bin/libterrain2d.linux.debug.x86_64.so"
+linux.release.x86_64 = "bin/libterrain2d.linux.release.x86_64.so"
+```
+
+## Implementation Details
+
+### 3. 2D Block System Design
+
+#### Block Structure for 2D
+```cpp
+// Block properties for 2D terrain
+struct Block2D {
+	uint8_t id;              // Block type ID (256 types)
+	uint8_t variant : 4;     // Visual variant (0-15)
+	uint8_t damage : 4;      // Damage level (0-15)
+	
+	// Physics properties
+	bool has_gravity : 1;    // Falls down (sand, gravel)
+	bool is_liquid : 1;      // Liquid block
+	bool is_platform : 1;    // Can pass through from below
+	bool supports_blend : 1; // Auto-tiles with neighbors
+	
+	// Lighting
+	uint8_t light_emission;  // Light level emitted
+	uint8_t light_opacity;   // How much light it blocks
+};
+
+// Multi-size block support
+struct BlockDefinition {
+	String name;
+	Vector2i size;           // Size in tiles (1x1, 4x4, 2x3, etc.)
+	float strength;          // HP before breaking
+	float density;           // For floating in liquids
+	int harvest_tool;        // Required tool tier
+	bool affected_by_gravity;
+	bool breaks_on_fall;     // Like sand torches in Terraria
+	
+	// Visual properties
+	String texture_path;
+	bool use_autotile;       // Use 47-tile blending
+	std::vector<uint8_t> blends_with; // Which blocks to blend with
+	bool has_connected_texture;
+	
+	// Special properties
+	bool is_door;
+	bool is_chest;
+	bool grows_plants;       // Like dirt/grass
+};
+```
+
+### 4. 2D Chunk Management
+
+#### 2D Chunk Implementation
+```cpp
+class Chunk2D {
+private:
+	static const int CHUNK_WIDTH = 32;   // Tiles wide
+	static const int CHUNK_HEIGHT = 32;  // Tiles tall
+	
+	Block2D blocks[CHUNK_WIDTH][CHUNK_HEIGHT];
+	Block2D background[CHUNK_WIDTH][CHUNK_HEIGHT]; // Background layer
+	uint8_t lighting[CHUNK_WIDTH][CHUNK_HEIGHT];   // Light levels
+	
+	Vector2i world_position;  // Chunk position in world
+	bool dirty_mesh;
+	bool dirty_lighting;
+	
+	// For rendering
+	RID tile_multimesh;       // Godot's MultiMesh for tiles
+    RID background_multimesh;
+    
+public:
+    void set_block(Vector2i local_pos, Block2D block, bool background = false);
+    Block2D get_block(Vector2i local_pos, bool background = false);
+    void update_lighting();
+    void generate_tile_data();
+};
+
+class ChunkManager2D {
+private:
+    // Use 2D grid for active chunks
+    std::unordered_map<Vector2i, std::unique_ptr<Chunk2D>> chunks;
+    
+	// Visible chunk range (like Terraria's screen bounds)
+	Rect2i visible_range;
+	
+	ThreadPool thread_pool;
+	
+public:
+	void update_visible_chunks(Rect2 camera_bounds);
+	void load_chunk(Vector2i chunk_pos);
+	void unload_distant_chunks();
+	void set_block_at_world(Vector2i world_pos, Block2D block);
+};
+```
+
+### 5. 2D Physics System
+
+#### Terraria-Style Physics
+```cpp
+class Physics2D {
+private:
+	struct FallingBlock {
+		Vector2 position;
+		Vector2 velocity;
+		Block2D block_type;
+	};
+	
+	std::vector<FallingBlock> falling_blocks;
+	
+public:
+	void update(float delta) {
+		// Update falling blocks (sand, gravel)
+		for (auto& fb : falling_blocks) {
+			fb.velocity.y += GRAVITY * delta;
+			fb.position += fb.velocity * delta;
+			
+			// Check collision with ground
+			Vector2i tile_pos = world_to_tile(fb.position);
+			if (is_solid_below(tile_pos)) {
+				// Place block or break if fragile
+				if (fb.block_type.breaks_on_fall && fb.velocity.y > BREAK_VELOCITY) {
+					spawn_item_drop(tile_pos, fb.block_type);
+				} else {
+					place_block(tile_pos, fb.block_type);
+				}
+				// Remove from falling list
+			}
+		}
+		
+		// Check structural integrity for platforms/buildings
+		check_support_structures();
+		
+		// Update entities standing on blocks
+		update_entity_platforms();
+	}
+	
+	void check_block_support(Vector2i pos) {
+		Block2D block = get_block(pos);
+		
+		if (block.has_gravity) {
+			// Check if supported below
+			if (!is_solid_below(pos)) {
+				// Convert to falling block
+				create_falling_block(pos, block);
+				remove_block(pos);
+			}
+		}
+		
+		// Check multi-block structures
+		if (block.size.x > 1 || block.size.y > 1) {
+			check_multi_block_support(pos, block);
+		}
+	}
+};
+```
+
+### 6. 2D Liquid System
+
+#### Starbound-Style Liquid Simulation
+```cpp
+class LiquidSystem2D {
+private:
+	struct LiquidCell {
+		float level;          // 0.0 to MAX_PRESSURE (can exceed 1.0)
+		uint8_t type;         // Water, lava, honey, etc.
+		float flow_rate;      // How fast it flows (honey is slow)
+	};
+	
+	// Store liquid separate from blocks for performance
+	std::unordered_map<Vector2i, LiquidCell> liquid_map;
+	
+public:
+	void simulate(float delta) {
+		std::vector<Vector2i> cells_to_update(liquid_map.size());
+		
+		for (auto& [pos, liquid] : liquid_map) {
+			// 1. Try to flow down
+			Vector2i below = pos + Vector2i(0, 1);
+			if (can_flow_to(below)) {
+				float flow = min(liquid.level, MAX_FLOW_RATE * delta);
+				transfer_liquid(pos, below, flow);
+			}
+			
+			// 2. If can't flow down or has excess, flow sideways
+            if (liquid.level > 0.1f) {
+                // Check pressure differential
+                float left_pressure = get_liquid_pressure(pos + Vector2i(-1, 0));
+                float right_pressure = get_liquid_pressure(pos + Vector2i(1, 0));
+                
+                // Flow to lower pressure
+                if (liquid.level > left_pressure) {
+                    transfer_liquid(pos, pos + Vector2i(-1, 0), 
+                                  (liquid.level - left_pressure) * 0.5f * delta);
+                }
+                if (liquid.level > right_pressure) {
+                    transfer_liquid(pos, pos + Vector2i(1, 0),
+                                  (liquid.level - right_pressure) * 0.5f * delta);
+                }
+            }
+            
+            // 3. Handle floating objects
+            check_buoyancy(pos, liquid);
+            
+            // 4. Evaporation
+            if (liquid.type == WATER) {
+                float evap_rate = get_biome_evaporation_rate(pos);
+                liquid.level -= evap_rate * delta;
+                
+                // Faster evaporation for shallow water
+                if (liquid.level < 0.2f) {
+                    liquid.level -= evap_rate * 2 * delta;
+                }
+            }
+        }
+        
+        // Clean up empty cells
+        cleanup_empty_cells();
+    }
+    
+    void apply_rain(Rect2 world_bounds) {
+        // Add water to exposed surfaces
+        for (int x = world_bounds.position.x; x < world_bounds.end.x; x++) {
+            int surface_y = find_surface_at_x(x);
+            if (surface_y != INVALID) {
+                add_liquid(Vector2i(x, surface_y), WATER, RAIN_AMOUNT);
+            }
+        }
+    }
+    
+    float calculate_buoyancy(Block2D object, LiquidCell liquid) {
+        // Objects float based on density
+        return (liquid.level * LIQUID_DENSITY[liquid.type]) - object.density;
+    }
+};
+```
+
+### 7. Auto-Tiling System (Terraria-Style Blending)
+
+#### 47-Tile Auto-Tiling Implementation
+```cpp
+class AutoTileSystem {
+private:
+    // Terraria uses 47 different tile configurations for smooth blending
+    enum TilePattern {
+        FULL_TILE = 0,
+        
+        // Edge connections (4)
+        EDGE_TOP, EDGE_RIGHT, EDGE_BOTTOM, EDGE_LEFT,
+        
+        // Corner connections (4)
+        CORNER_TOP_LEFT, CORNER_TOP_RIGHT,
+        CORNER_BOTTOM_LEFT, CORNER_BOTTOM_RIGHT,
+        
+        // Combined patterns (38 more combinations)
+        // ... all 47 total patterns
+    };
+    
+    struct TileBlendData {
+        TilePattern pattern;
+        Vector2 texture_offset;  // UV offset in tileset
+        bool flip_h, flip_v;     // Reuse tiles via flipping
+    };
+    
+public:
+    TileBlendData calculate_blend(Vector2i pos, Block2D center) {
+        // Check 8 surrounding tiles
+        bool neighbors[8];
+        neighbors[0] = should_blend(get_block(pos + Vector2i(-1, -1)), center); // Top-left
+        neighbors[1] = should_blend(get_block(pos + Vector2i( 0, -1)), center); // Top
+        neighbors[2] = should_blend(get_block(pos + Vector2i( 1, -1)), center); // Top-right
+        neighbors[3] = should_blend(get_block(pos + Vector2i(-1,  0)), center); // Left
+        neighbors[4] = should_blend(get_block(pos + Vector2i( 1,  0)), center); // Right
+        neighbors[5] = should_blend(get_block(pos + Vector2i(-1,  1)), center); // Bottom-left
+        neighbors[6] = should_blend(get_block(pos + Vector2i( 0,  1)), center); // Bottom
+        neighbors[7] = should_blend(get_block(pos + Vector2i( 1,  1)), center); // Bottom-right
+        
+        // Map to one of 47 patterns
+        TilePattern pattern = neighbor_pattern_to_tile(neighbors);
+        
+        // Get texture coordinates from pattern
+        return get_tile_blend_data(pattern);
+    }
+    
+    void generate_smooth_edges(Vector2i pos, MeshData& mesh) {
+        // Add rounded corners and smooth transitions
+        Block2D center = get_block(pos);
+        
+        if (!center.supports_blend) {
+            add_simple_tile(mesh, pos);
+            return;
+        }
+        
+        TileBlendData blend = calculate_blend(pos, center);
+        
+        // Generate vertices with smooth blending
+        add_blended_tile(mesh, pos, blend);
+    }
+};
+```
+
+### 8. 2D Rendering System
+
+#### Tile-Based Rendering
+```cpp
+class TileRenderer {
+private:
+    // Texture atlas for all tiles
+    Ref<Texture2D> tile_atlas;
+    Ref<Texture2D> blend_atlas;  // 47-tile blend patterns
+    
+	// Use Godot's TileMap or custom renderer
+	struct TileRenderData {
+		Vector2 position;
+		Vector2 uv_offset;
+		Vector2 uv_size;
+		Color modulate;
+		float rotation;
+	};
+	
+public:
+	void render_chunk(Chunk2D* chunk) {
+		std::vector<TileRenderData> foreground_tiles;
+		std::vector<TileRenderData> background_tiles;
+		
+		for (int x = 0; x < CHUNK_WIDTH; x++) {
+			for (int y = 0; y < CHUNK_HEIGHT; y++) {
+				Block2D block = chunk->get_block(Vector2i(x, y));
+				
+				if (block.id != EMPTY) {
+					TileRenderData tile;
+					tile.position = chunk_to_world(chunk->position, Vector2i(x, y));
+					
+					if (block.supports_blend) {
+						// Use auto-tiling
+						auto blend = auto_tile_system.calculate_blend(
+							chunk_to_world_pos(chunk->position, Vector2i(x, y)), 
+							block
+						);
+						tile.uv_offset = blend.texture_offset;
+					} else {
+						// Simple tile
+						tile.uv_offset = get_tile_uv(block.id, block.variant);
+					}
+					
+					// Apply lighting
+					float light = chunk->get_light_level(Vector2i(x, y));
+					tile.modulate = Color(light, light, light);
+					
+					foreground_tiles.push_back(tile);
+				}
+				
+				// Render background layer
+				Block2D bg = chunk->get_block(Vector2i(x, y), true);
+				if (bg.id != EMPTY) {
+					// Similar for background with darker tint
+				}
+			}
+		}
+		
+		// Batch render all tiles
+		render_tile_batch(foreground_tiles, tile_atlas);
+		render_tile_batch(background_tiles, tile_atlas, 0.6f); // Darker
+	}
+};
+```
+
+### 9. 2D Lighting System
+
+#### Terraria-Style Lighting
+```cpp
+class LightingSystem2D {
+private:
+	struct LightSource {
+		Vector2i position;
+		float intensity;
+		Color color;
+		bool dynamic;  // Flickers like torch
+	};
+	
+	std::vector<LightSource> light_sources;
+	
+public:
+	void calculate_lighting(Chunk2D* chunk) {
+		// Reset light levels
+		chunk->clear_lighting();
+		
+		// Add sunlight from top
+		for (int x = 0; x < CHUNK_WIDTH; x++) {
+			float sunlight = 1.0f;
+			for (int y = 0; y < CHUNK_HEIGHT; y++) {
+				Block2D block = chunk->get_block(Vector2i(x, y));
+				
+				// Reduce light based on opacity
+				sunlight *= (1.0f - block.light_opacity / 255.0f);
+				
+				chunk->set_light_level(Vector2i(x, y), sunlight);
+				
+				if (sunlight < 0.01f) break; // Too dark to continue
+			}
+		}
+		
+		// Add point lights (torches, etc.)
+		for (const auto& light : light_sources) {
+			spread_light(chunk, light.position, light.intensity, light.color);
+		}
+		
+		// Smooth lighting for better visuals
+		smooth_lighting(chunk);
+	}
+	
+	void spread_light(Chunk2D* chunk, Vector2i source, float intensity, Color color) {
+		// Breadth-first light spreading
+		std::queue<std::pair<Vector2i, float>> to_process;
+		to_process.push({source, intensity});
+		
+		while (!to_process.empty()) {
+			auto [pos, light_level] = to_process.front();
+			to_process.pop();
+			
+			if (light_level < 0.01f) continue;
+			
+			// Spread to neighbors
+			for (auto& dir : {Vector2i(0,-1), Vector2i(1,0), Vector2i(0,1), Vector2i(-1,0)}) {
+				Vector2i next = pos + dir;
+				Block2D block = chunk->get_block(next);
+				
+				float new_light = light_level * (1.0f - block.light_opacity / 255.0f) * 0.9f;
+				
+				if (new_light > chunk->get_light_level(next)) {
+					chunk->set_light_level(next, new_light);
+					to_process.push({next, new_light});
+				}
+			}
+		}
+	}
+};
+```
+
+### 10. Multiplayer System
+
+#### Player-Hosted Servers
+```cpp
+class NetworkManager2D {
+private:
+	bool is_host;
+	std::vector<PlayerConnection> clients;
+	
+	// Message types
+	enum MessageType : uint8_t {
+		BLOCK_PLACE = 0x01,
+		BLOCK_BREAK = 0x02,
+		LIQUID_UPDATE = 0x03,
+		CHUNK_DATA = 0x04,
+		PLAYER_MOVE = 0x05,
+		ENTITY_SPAWN = 0x06
+	};
+	
+public:
+	void host_game(int port) {
+		is_host = true;
+		// Start listening for connections
+		start_server(port);
+	}
+	
+	void join_game(String address, int port) {
+		is_host = false;
+		connect_to_host(address, port);
+	}
+	
+	void sync_block_change(Vector2i pos, Block2D block) {
+		if (is_host) {
+			// Host authoritative - apply immediately
+			set_block(pos, block);
+			
+			// Broadcast to all clients
+			for (auto& client : clients) {
+				send_block_update(client, pos, block);
+			}
+		} else {
+			// Client - request from host
+			request_block_change(pos, block);
+		}
+	}
+};
+```
+
+### 11. World Generation
+
+#### 2D Terrain Generation
+```cpp
+class WorldGenerator2D {
+private:
+	FastNoise noise;
+	
+	struct BiomeData {
+		float temperature;
+		float humidity;
+		int surface_block;
+		int subsurface_block;
+		int stone_block;
+	};
+	
+public:
+	void generate_chunk(Chunk2D* chunk) {
+		Vector2i chunk_world_pos = chunk->get_world_position();
+		
+		for (int x = 0; x < CHUNK_WIDTH; x++) {
+			// Generate height map
+			float world_x = chunk_world_pos.x + x;
+			float height = generate_terrain_height(world_x);
+			
+			// Determine biome
+			BiomeData biome = get_biome_at(world_x);
+			
+			for (int y = 0; y < CHUNK_HEIGHT; y++) {
+				float world_y = chunk_world_pos.y + y;
+				
+				Block2D block;
+				
+				if (world_y > height) {
+					// Above ground
+					if (world_y < SEA_LEVEL) {
+						block.id = WATER;
+					} else {
+						block.id = AIR;
+					}
+				} else if (world_y > height - 1) {
+					// Surface
+					block.id = biome.surface_block;
+				} else if (world_y > height - 5) {
+					// Subsurface
+					block.id = biome.subsurface_block;
+				} else {
+					// Deep underground
+					block.id = biome.stone_block;
+					
+					// Add ores
+					generate_ores(world_x, world_y, block);
+					
+					// Add caves
+					if (is_cave(world_x, world_y)) {
+						block.id = AIR;
+					}
+				}
+				
+				chunk->set_block(Vector2i(x, y), block);
+			}
+		}
+		
+		// Add structures (dungeons, houses, etc.)
+		generate_structures(chunk);
+	}
+	
+	float generate_terrain_height(float x) {
+		// Multiple octaves for interesting terrain
+		float height = 0;
+		height += noise.GetPerlin(x * 0.01f, 0) * 100;  // Large features
+		height += noise.GetPerlin(x * 0.05f, 0) * 20;   // Medium features
+		height += noise.GetPerlin(x * 0.1f, 0) * 5;     // Small details
+		
+		return SEA_LEVEL + height;
+	}
+};
+```
+
+### 12. Performance Optimizations for 2D
+
+#### 2D-Specific Optimizations
+```cpp
+class PerformanceOptimizations {
+	// Chunk loading pattern for 2D
+	void update_active_chunks(Vector2 camera_center, Vector2 screen_size) {
+		// Only load chunks visible on screen + buffer
+		Rect2 visible_area(
+			camera_center - screen_size / 2 - BUFFER,
+			screen_size + BUFFER * 2
+		);
+		
+		Vector2i min_chunk = world_to_chunk(visible_area.position);
+		Vector2i max_chunk = world_to_chunk(visible_area.get_end());
+		
+		for (int x = min_chunk.x; x <= max_chunk.x; x++) {
+			for (int y = min_chunk.y; y <= max_chunk.y; y++) {
+				ensure_chunk_loaded(Vector2i(x, y));
+			}
+		}
+	}
+	
+	// Occlusion culling for 2D
+	void cull_hidden_tiles(Chunk2D* chunk) {
+		// Don't render tiles completely surrounded by solid blocks
+        for (int x = 1; x < CHUNK_WIDTH - 1; x++) {
+            for (int y = 1; y < CHUNK_HEIGHT - 1; y++) {
+                if (is_surrounded_by_solid(chunk, x, y)) {
+                    mark_tile_hidden(x, y);
+                }
+            }
+        }
+    }
+    
+    // Batch rendering for tiles
+    void batch_render_tiles() {
+		// Use Godot's MultiMeshInstance2D or custom batching
+		// Group tiles by texture to minimize draw calls
+	}
+};
+```
+
+### 13. GDScript Interface for 2D
+
+```gdscript
+class_name Terrain2D extends Node2D
+
+# Properties
+@export var chunk_size := Vector2i(32, 32)
+@export var tile_size := 16  # Pixels per tile
+@export var view_distance := 10  # Chunks
+
+# Signals
+signal chunk_generated(chunk_pos: Vector2i)
+signal block_placed(world_pos: Vector2i, block_id: int)
+signal block_broken(world_pos: Vector2i, block_id: int)
+signal liquid_flow(from: Vector2i, to: Vector2i)
+
+# Methods accessible from GDScript
+func set_block(world_pos: Vector2i, block_id: int, background := false) -> void
+func get_block(world_pos: Vector2i, background := false) -> int
+func add_liquid(world_pos: Vector2i, liquid_type: int, amount: float) -> void
+func explode(center: Vector2, radius: float, destroy_tiles := true) -> void
+func get_surface_height(x: int) -> int
+func find_spawn_point() -> Vector2i
+
+# Multiplayer
+func host_world(port: int) -> void
+func join_world(address: String, port: int) -> void
+func save_world(path: String) -> void
+func load_world(path: String) -> void
+```
+
+## Development Strategy
+
+### Phase 1: Core 2D Systems (Week 1)
+- Basic 2D chunk system
+- Simple tile rendering
+- Block placement/breaking
+- Basic world generation
+
+### Phase 2: Physics & Liquids (Week 2)
+- Falling blocks (sand/gravel)
+- 2D liquid flow with pressure
+- Buoyancy system
+- Rain and evaporation
+
+### Phase 3: Visual Polish (Week 3)
+- 47-tile auto-tiling system
+- Smooth edge blending
+- 2D lighting system
+- Background layers
+
+### Phase 4: Advanced Features (Week 4)
+- Multi-size blocks (furniture, doors)
+- Biome system
+- Structure generation
+- Plant growth timers
+
+### Phase 5: Multiplayer (Week 5)
+- Player hosting
+- State synchronization
+- Save/load system
+
+## Critical 2D-Specific Notes
+
+### Rendering Approach
+- Use TileMap nodes or custom MultiMeshInstance2D
+- Layer system: Background → Blocks → Liquids → Entities → Lighting
+- Parallax scrolling for background layers
+
+### Physics Differences from 3D
+- Gravity only on Y axis
+- Liquid flows left/right and down only
+- Simpler collision detection (AABB only)
+- Platform mechanics (one-way collision)
+
+### Memory Optimization
+- 2D arrays instead of 3D (much less memory)
+- Smaller chunks can be used (32x32 vs 16x16x16)
+- Simpler mesh data (quads only)
+
+### Terraria-Specific Features to Implement
+- Hammer slope modifications (half-blocks, slopes)
+- Platform stairs
+- Actuated blocks (solid/non-solid toggle)
+- Wiring system for mechanisms
+- Paint system for color variants
+
+## Testing Considerations
+- Test with 4000-5000 visible tiles
+- Ensure smooth scrolling at 60 FPS
+- Test liquid with 100+ cells
+- Network test with 4-8 players
+
+## Reference Implementation Notes
+Based on research of Terraria and Starbound:
+- Terraria uses 16x16 pixel tiles
+- Chunks are typically 32x32 or 64x64 tiles
+- Liquid updates at 30Hz independently
+- Physics runs at fixed timestep (60Hz)
+- Network updates at 60Hz for smooth multiplayer
