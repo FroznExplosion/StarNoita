@@ -21,7 +21,8 @@ void BiomeSystem::initialize_default_biomes() {
     plains.max_height = LAYER_SURFACE_TOP;
     plains.surface_block = 5;  // grass
     plains.subsurface_block = 2; // dirt
-    plains.stone_block = 1;
+    plains.stone_block = 1;      // stone
+    plains.cave_stone_block = 10; // cave_stone
     plains.terrain_amplitude = 30.0f;
     plains.ores = {
         {6, 0.7f, 0, 2000, 3, 8},    // Copper
@@ -39,6 +40,8 @@ void BiomeSystem::initialize_default_biomes() {
     forest.max_height = LAYER_SURFACE_TOP;
     forest.surface_block = 5;  // grass
     forest.subsurface_block = 2; // dirt
+    forest.stone_block = 1;      // stone
+    forest.cave_stone_block = 10; // cave_stone
     forest.terrain_amplitude = 40.0f;
     forest.rain_frequency = 0.3f;
     forest.ores = {
@@ -57,6 +60,8 @@ void BiomeSystem::initialize_default_biomes() {
     desert.max_height = LAYER_SURFACE_TOP;
     desert.surface_block = 3;  // sand
     desert.subsurface_block = 3; // sand
+    desert.stone_block = 1;      // stone
+    desert.cave_stone_block = 10; // cave_stone
     desert.terrain_amplitude = 20.0f;
     desert.evaporation_rate = 3.0f;
     desert.rain_frequency = 0.01f;
@@ -77,6 +82,8 @@ void BiomeSystem::initialize_default_biomes() {
     snow.max_height = LAYER_SKY_BOTTOM;
     snow.surface_block = 3;  // TODO: snow block
     snow.subsurface_block = 2; // dirt
+    snow.stone_block = 1;      // stone
+    snow.cave_stone_block = 10; // cave_stone
     snow.terrain_amplitude = 60.0f;
     snow.cannot_border = {DESERT, JUNGLE};
     snow.ores = {
@@ -94,6 +101,8 @@ void BiomeSystem::initialize_default_biomes() {
     mountains.max_height = LAYER_SKY_BOTTOM;
     mountains.surface_block = 1;  // stone
     mountains.subsurface_block = 1;
+    mountains.stone_block = 1;      // stone
+    mountains.cave_stone_block = 10; // cave_stone
     mountains.terrain_amplitude = 150.0f;
     mountains.ores = {
         {6, 0.4f, 0, 1500, 3, 6},
@@ -111,6 +120,7 @@ void BiomeSystem::initialize_default_biomes() {
     cave.min_height = 0;
     cave.max_height = LAYER_UNDERGROUND_BOTTOM;
     cave.stone_block = 1;
+    cave.cave_stone_block = 10; // cave_stone
     cave.background_block = 10;
     cave.cave_frequency = 0.08f;
     cave.ambient_light = Color(0.3, 0.3, 0.4);

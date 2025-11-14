@@ -184,11 +184,72 @@ bool BlockDamageSystem::apply_damage_to_block(Vector2i tile_pos, float damage, b
     if (current_health <= 0.0f) {
         result.overkill_damage = -current_health; // How much extra damage was dealt
         handle_block_destruction(tile_pos, is_background, result);
+        // Remove from regeneration tracker
+        regeneration_tracker.erase(tile_pos);
         return true;
     } else {
         // Update health
         chunk_manager->set_block_health(tile_pos, current_health, def->max_health);
+
+        // Track for regeneration
+        BlockRegeneration& regen = regeneration_tracker[tile_pos];
+        regen.last_damage_time = current_time;
+        regen.next_regen_time = current_time + 2.0f; // 2 second delay before regen starts
+
         return false;
+    }
+}
+
+void BlockDamageSystem::update_regeneration(float delta_time) {
+    current_time += delta_time;
+
+    std::vector<Vector2i> to_remove;
+
+    for (auto& [pos, regen] : regeneration_tracker) {
+        // Check if 2 second delay has passed
+        if (current_time < regen.next_regen_time) {
+            continue; // Still waiting
+        }
+
+        // Regenerate 35 health per 0.5 seconds
+        const Block2D* block = chunk_manager->get_block_at_tile(pos);
+        if (!block || block->type_id == 0) {
+            to_remove.push_back(pos);
+            continue;
+        }
+
+        const BlockDefinition* def = block_registry->get_block_definition(block->type_id);
+        if (!def) {
+            to_remove.push_back(pos);
+            continue;
+        }
+
+        // Get current health
+        BlockHealth* health = chunk_manager->get_block_health(pos);
+        if (!health) {
+            // Fully healed already
+            to_remove.push_back(pos);
+            continue;
+        }
+
+        // Regenerate health
+        float new_health = health->current_health + 35.0f;
+
+        if (new_health >= def->max_health) {
+            // Fully healed
+            chunk_manager->set_block_health(pos, def->max_health, def->max_health);
+            to_remove.push_back(pos);
+        } else {
+            // Partially healed
+            chunk_manager->set_block_health(pos, new_health, def->max_health);
+            // Schedule next regen tick in 0.5 seconds
+            regen.next_regen_time = current_time + 0.5f;
+        }
+    }
+
+    // Remove fully healed blocks from tracker
+    for (const auto& pos : to_remove) {
+        regeneration_tracker.erase(pos);
     }
 }
 

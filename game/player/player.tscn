@@ -1,0 +1,27 @@
+[gd_scene load_steps=3 format=3 uid="uid://player_scene"]
+
+[ext_resource type="Script" path="res://game/player/player_controller.gd" id="1"]
+
+[sub_resource type="RectangleShape2D" id="RectangleShape2D_1"]
+size = Vector2(32, 48)
+
+[node name="Player" type="CharacterBody2D"]
+script = ExtResource("1")
+speed = 200.0
+jump_velocity = -400.0
+mining_reach = 5
+
+[node name="Sprite2D" type="Sprite2D" parent="."]
+modulate = Color(0.3, 0.5, 1, 1)
+position = Vector2(0, 0)
+scale = Vector2(32, 48)
+
+[node name="CollisionShape2D" type="CollisionShape2D" parent="."]
+shape = SubResource("RectangleShape2D_1")
+
+[node name="MiningCursor" type="Node2D" parent="."]
+
+[node name="CursorSprite" type="Sprite2D" parent="MiningCursor"]
+modulate = Color(1, 1, 0, 0.5)
+scale = Vector2(48, 48)
+z_index = 100

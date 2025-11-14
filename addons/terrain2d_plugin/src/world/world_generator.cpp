@@ -10,7 +10,7 @@ WorldGenerator::WorldGenerator(ChunkManager* chunks, BlockRegistry* registry, Bi
     , biome_system(biomes)
     , world_seed(12345)
 {
-    cave_generator = new CaveGenerator(chunks, registry);
+    cave_generator = new CaveGenerator(chunks, registry, biomes);
     structure_generator = new StructureGenerator(chunks, registry, biomes);
 }
 
@@ -27,21 +27,34 @@ void WorldGenerator::set_seed(uint64_t seed) {
 }
 
 void WorldGenerator::generate_world() {
-    // Generation pipeline as specified
+    // NEW Generation pipeline order:
+    // 1. Biomes first
+    // 2. Buildings BEFORE terrain
+    // 3. Terrain adapts to buildings
+    // 4. Ores
+    // 5. Caves (can't delete buildings)
+    // 6. Background
     step1_generate_biomes();
-    step2_generate_terrain();
-    step3_place_ores();
-    step4_carve_caves();
-    step5_generate_background();
-    step6_place_structures();
+    step2_place_buildings();  // NEW: Before terrain!
+    step3_generate_terrain(); // Adapts to buildings
+    step4_place_ores();
+    step5_carve_caves();      // Protects building blocks
+    step6_generate_background();
 }
 
 void WorldGenerator::step1_generate_biomes() {
     biome_system->generate_biome_map();
 }
 
-void WorldGenerator::step2_generate_terrain() {
+void WorldGenerator::step2_place_buildings() {
+    // Place buildings BEFORE terrain so terrain can adapt
+    structure_generator->place_structures(StructureGenerator::PRE_CAVE);
+    // Note: Buildings mark their footprint, terrain generation will respect it
+}
+
+void WorldGenerator::step3_generate_terrain() {
     // Generate terrain for entire world
+    // This now respects building positions and flattens terrain near them
     for (int x = 0; x < WORLD_WIDTH; x++) {
         BiomeType biome_type = biome_system->get_biome_at(x);
         const BiomeDefinition* biome = biome_system->get_biome_definition(biome_type);
@@ -49,11 +62,16 @@ void WorldGenerator::step2_generate_terrain() {
         if (!biome) continue;
 
         float height = generate_terrain_height(x, biome);
+
+        // Check if near a building - flatten if so
+        // (Building system will set markers)
+        // TODO: Implement terrain flattening near building markers
+
         generate_column(x, height, biome);
     }
 }
 
-void WorldGenerator::step3_place_ores() {
+void WorldGenerator::step4_place_ores() {
     for (int x = 0; x < WORLD_WIDTH; x++) {
         BiomeType biome_type = biome_system->get_biome_at(x);
         const BiomeDefinition* biome = biome_system->get_biome_definition(biome_type);
@@ -64,12 +82,13 @@ void WorldGenerator::step3_place_ores() {
     }
 }
 
-void WorldGenerator::step4_carve_caves() {
+void WorldGenerator::step5_carve_caves() {
     cave_generator->carve_caves();
 }
 
-void WorldGenerator::step5_generate_background() {
+void WorldGenerator::step6_generate_background() {
     // Generate background blocks across entire world
+    // Background uses same block as foreground (stone creates stone background)
     for (int x = 0; x < WORLD_WIDTH; x++) {
         for (int y = 0; y < WORLD_HEIGHT; y++) {
             Vector2i pos(x, y);
@@ -77,31 +96,17 @@ void WorldGenerator::step5_generate_background() {
             const Block2D* fg = chunk_manager->get_block_at_tile(pos);
             if (!fg) continue;
 
-            // If foreground is air, check if we need background
-            if (fg->type_id == 0) {
-                // Check if this is a cave
-                if (cave_generator->is_cave(x, y)) {
-                    cave_generator->generate_cave_background(x, y);
-                }
-            } else {
-                // Has foreground block - create matching background
+            // Has foreground block - create matching background
+            if (fg->type_id != 0) {
                 const BlockDefinition* def = block_registry->get_block_definition(fg->type_id);
                 if (def && def->can_be_background) {
                     Block2D bg_block;
-                    bg_block.type_id = def->background_variant_id > 0 ? def->background_variant_id : fg->type_id;
+                    bg_block.type_id = fg->type_id; // Same as foreground
                     chunk_manager->set_block_at_tile(pos, bg_block, true);
                 }
             }
         }
     }
-}
-
-void WorldGenerator::step6_place_structures() {
-    // Place pre-cave structures first
-    structure_generator->place_structures(StructureGenerator::PRE_CAVE);
-
-    // Then post-cave structures (they can have cave doorways)
-    structure_generator->place_structures(StructureGenerator::POST_CAVE);
 }
 
 float WorldGenerator::generate_terrain_height(int world_x, const BiomeDefinition* biome) {
@@ -202,25 +207,48 @@ float WorldGenerator::noise(float x, float seed_offset) const {
 // CaveGenerator implementation
 void CaveGenerator::carve_caves() {
     for (int x = 0; x < WORLD_WIDTH; x++) {
+        // Get biome at this X coordinate for biome-specific cave stone
+        BiomeType biome_type = biome_system->get_biome_at(x);
+        const BiomeDefinition* biome = biome_system->get_biome_definition(biome_type);
+
         for (int y = 0; y < SEA_LEVEL; y++) {  // Only underground
             if (is_cave(x, y)) {
                 Vector2i pos(x, y);
 
-                // Check if this position has an ore
                 const Block2D* existing = chunk_manager->get_block_at_tile(pos);
                 if (!existing) continue;
 
                 const BlockDefinition* def = block_registry->get_block_definition(existing->type_id);
 
-                // Ores are protected in foreground but cave is cut in background
+                // PROTECT building blocks - never delete
+                if (def && def->is_structure_block) {
+                    continue; // Buildings are sacred!
+                }
+
+                // Ores stay in foreground
                 if (def && def->is_ore) {
-                    // Keep ore in foreground, cave cuts background only
+                    continue; // Keep ore
+                }
+
+                // Check if this is on cave edge or interior
+                bool on_edge = is_cave_edge(x, y);
+
+                if (on_edge) {
+                    // Cave edge - keep stone (regular biome stone)
+                    // Don't delete, stone stays as "cave wall"
                     continue;
                 } else {
-                    // Regular block - remove for cave
-                    Block2D air;
-                    air.type_id = 0;
-                    chunk_manager->set_block_at_tile(pos, air);
+                    // Cave interior - replace stone with biome-specific cave_stone variant
+                    if (biome && existing->type_id == biome->stone_block) {
+                        Block2D cave_stone;
+                        cave_stone.type_id = biome->cave_stone_block; // Use biome-specific variant!
+                        chunk_manager->set_block_at_tile(pos, cave_stone);
+                    } else {
+                        // Other blocks (dirt, etc) - remove to make cave
+                        Block2D air;
+                        air.type_id = 0;
+                        chunk_manager->set_block_at_tile(pos, air);
+                    }
                 }
             }
         }

@@ -26,7 +26,8 @@ struct BiomeDefinition {
     // Block palette
     uint16_t surface_block;      // Top layer (grass, sand, etc.)
     uint16_t subsurface_block;   // Below surface (dirt, sandstone)
-    uint16_t stone_block;        // Deep underground
+    uint16_t stone_block;        // Deep underground (regular stone)
+    uint16_t cave_stone_block;   // Cave variant (looks different, drops stone_block)
     uint16_t background_block;   // Background variant
 
     // Terrain generation
@@ -63,7 +64,8 @@ struct BiomeDefinition {
         , surface_block(5)  // grass
         , subsurface_block(2) // dirt
         , stone_block(1)    // stone
-        , background_block(10) // bg stone
+        , cave_stone_block(10) // cave stone
+        , background_block(1) // stone (for background)
         , terrain_frequency(0.01f)
         , terrain_amplitude(50.0f)
         , cave_frequency(0.05f)

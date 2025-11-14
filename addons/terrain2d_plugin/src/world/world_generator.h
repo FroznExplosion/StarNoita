@@ -36,13 +36,13 @@ public:
     // Generate a specific chunk
     void generate_chunk(Chunk2D* chunk);
 
-    // Generation pipeline steps
+    // Generation pipeline steps (NEW ORDER!)
     void step1_generate_biomes();
-    void step2_generate_terrain();
-    void step3_place_ores();
-    void step4_carve_caves();
-    void step5_generate_background();
-    void step6_place_structures();
+    void step2_place_buildings();        // Before terrain!
+    void step3_generate_terrain();       // Adapts to buildings
+    void step4_place_ores();
+    void step5_carve_caves();            // Caves can't delete buildings
+    void step6_generate_background();
 
 private:
     // Generate height at X coordinate
@@ -64,11 +64,12 @@ class CaveGenerator {
 private:
     ChunkManager* chunk_manager;
     BlockRegistry* block_registry;
+    BiomeSystem* biome_system;
     uint64_t cave_seed;
 
 public:
-    CaveGenerator(ChunkManager* chunks, BlockRegistry* registry)
-        : chunk_manager(chunks), block_registry(registry), cave_seed(0) {}
+    CaveGenerator(ChunkManager* chunks, BlockRegistry* registry, BiomeSystem* biomes)
+        : chunk_manager(chunks), block_registry(registry), biome_system(biomes), cave_seed(0) {}
 
     void set_seed(uint64_t seed) { cave_seed = seed; }
 

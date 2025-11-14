@@ -31,17 +31,30 @@ struct DamageResult {
     DamageResult() : block_destroyed(false), destroyed_block_id(0), overkill_damage(0.0f) {}
 };
 
+// Block regeneration tracker
+struct BlockRegeneration {
+    float last_damage_time;     // Time when block was last damaged
+    float next_regen_time;      // Time for next regeneration tick
+
+    BlockRegeneration() : last_damage_time(0.0f), next_regen_time(0.0f) {}
+};
+
 class BlockDamageSystem {
 private:
     ChunkManager* chunk_manager;
     BlockRegistry* block_registry;
     BlockTensionSystem* tension_system;
 
+    // Track damaged blocks for regeneration
+    std::unordered_map<Vector2i, BlockRegeneration, Vector2iHash> regeneration_tracker;
+    float current_time;  // Track game time
+
 public:
     BlockDamageSystem(ChunkManager* chunks, BlockRegistry* registry, BlockTensionSystem* tension)
         : chunk_manager(chunks)
         , block_registry(registry)
         , tension_system(tension)
+        , current_time(0.0f)
     {}
 
     // Damage a single block
@@ -63,6 +76,10 @@ public:
 
     // Restore block to full health
     void restore_block_health(Vector2i tile_pos);
+
+    // Update regeneration system (call every frame)
+    // Regenerates blocks after 2 seconds: 35 health per 0.5 seconds
+    void update_regeneration(float delta_time);
 
 private:
     // Apply damage and check if block should be destroyed
