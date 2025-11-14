@@ -1,7 +1,7 @@
 # StarNoita Complete System Implementation Guide
 ## Godot 4.5 + C++ GDExtension Terrain System
 
-**Last Updated**: 2025-11-14
+**Last Updated**: 2025-11-14 (Updated with health regen, biome-specific caves, and game scenes)
 **Target**: Claude Code / AI Implementation Assistant
 **World Dimensions**: 1600 blocks wide (wraps) × 10000 blocks tall (0=bedrock, 8000=sea level)
 
@@ -100,38 +100,93 @@ Create a 2D procedural terrain system combining:
 - **3×3 Cursor**: Damages 9 center blocks
 - **Surrounding damage**: 16 outer ring blocks take **50% of applied damage** (post-reduction)
 - **Accumulation**: Damage persists until blocks break
+- **Health Regeneration**:
+  - After 2 seconds of no damage, blocks begin regenerating
+  - Regenerates 35 health per 0.5 seconds until full
+  - Tracked per-block with `BlockRegeneration` struct
 
 #### 5. Block Registry (`src/core/block_registry.*`)
 - Singleton registry for all block types
 - GDScript-accessible BlockResource
-- **12 Default blocks**:
+- **13 Default blocks**:
   - Air (0), Stone (1), Dirt (2), Sand (3), Gravel (4)
-  - Grass (5), Copper (6), Iron (7), Gold (8)
-  - Torch (9), Background Stone (10), Cave Wall (11)
+  - Grass (5), Copper Ore (6), Iron Ore (7), Gold Ore (8)
+  - Torch (9), Cave Stone (10), Mossy Stone (11), Mossy Cave Stone (12)
 
 #### 6. Biome System (`src/world/biome_system.*`)
 - Climate-based selection (temperature + humidity)
 - Biome compatibility rules (desert can't border snow)
 - Ore distribution per biome
 - **6 Biomes**: Plains, Forest, Desert, Snow, Mountains, Cave
+- **Biome-specific cave stones**: Each biome defines `cave_stone_block` for unique cave visuals
+  - Regular biomes use Cave Stone (10)
+  - Future swamp biome would use Mossy Cave Stone (12)
 
 #### 7. World Generation (`src/world/world_generator.*`)
-**6-Step Pipeline**:
-1. **Generate Biomes**: Climate noise → biome map
-2. **Generate Terrain**: Multi-octave noise → height map → block columns
-3. **Place Ores**: Per-biome ore veins based on depth/rarity
-4. **Carve Caves**: 3D noise → remove blocks (ores protected!)
-5. **Generate Background**:
-   - Foreground blocks → matching background variant
-   - Cave edges → cave_wall (11)
-   - Cave interior → background_stone (10)
-   - **Ores keep background version** in caves (ore priority!)
-6. **Place Structures**: PRE_CAVE and POST_CAVE phases
+**6-Step Pipeline** (Buildings-First Approach):
+1. **Generate Biomes**: Climate noise → biome map across all X coordinates
+2. **Place Buildings**: Structures placed BEFORE terrain, terrain adapts around them
+   - Buildings above and below sea level
+   - Max 2 terrain flattening markers per building
+   - Blocks marked with `is_structure_block = true`
+3. **Generate Terrain**: Multi-octave noise → height map → block columns
+   - Respects building footprints and flattens terrain near markers
+4. **Place Ores**: Per-biome ore veins based on depth/rarity
+   - Only replaces stone blocks with ore
+5. **Carve Caves**: 3D noise → remove blocks, but with protections:
+   - **Building blocks protected**: Never delete blocks with `is_structure_block`
+   - **Ores protected**: Ore blocks stay in foreground
+   - **Cave edges**: Keep regular stone as outline (natural cave walls)
+   - **Cave interior**: Replace stone with biome-specific `cave_stone_block`
+   - Other blocks (dirt, etc.) removed to create open space
+6. **Generate Background**: Foreground blocks → matching background variant
 
-**Cave System**:
-- Edges detected via neighbor check → outlined with cave_wall
-- Interior gets different background_stone
-- Ores in foreground → caves cut around them, ore stays in background too
+**Cave System Details**:
+- Edge detection: Check 4 cardinal neighbors, if any non-cave = edge position
+- Stone stays on edges as natural cave wall outline
+- Interior stone replaced with biome-specific cave_stone (e.g., cave_stone ID 10)
+- Cave stones have different texture but drop regular stone when mined
+- Ores in foreground stay visible, protected from cave carving
+
+#### 8. Game Scenes (`game/`)
+Complete Godot scene structure for playable game:
+
+**Main Scene** (`game/main.tscn`):
+- Root Node2D with Camera2D (smooth following, 2× zoom)
+- Terrain2D node with terrain_controller.gd wrapper
+- Player instance positioned at spawn (Y=-5000, above sea level)
+- HUD in CanvasLayer
+
+**Player Scene** (`game/player/player.tscn`):
+- CharacterBody2D with physics (gravity, jumping, movement)
+- 3×3 mining cursor that follows mouse
+- Visual reach indicator (yellow when in range, red when out of range)
+- Controls: WASD/Arrows (move), Space (jump), Left Click (mine), Right Click (place)
+
+**Player Controller** (`game/player/player_controller.gd`):
+- Movement with configurable speed (default 200 units/s)
+- Jump with configurable velocity (default -400)
+- Mining reach check (default 5 tiles = 80 pixels)
+- Calls `terrain_manager.damage_blocks_3x3()` for mining
+- Cursor snaps to tile grid, shows 3×3 affected area
+
+**HUD Scene** (`game/ui/hud.tscn`):
+- Top-left panel: Health bar, depth display, biome name
+- Top-right panel: FPS counter, chunks loaded count
+- Center crosshair for aiming
+
+**Terrain Controller** (`game/world/terrain_controller.gd`):
+- GDScript wrapper for C++ Terrain2D plugin
+- Initializes chunk_manager, block_registry, world_generator, etc.
+- Auto-generates world on ready with configurable seed
+- Provides API: `damage_blocks_3x3()`, `place_block()`, `get_block_at()`, `get_biome_at_position()`
+- Updates active chunks based on camera position
+
+**Project Settings** (`project.godot`):
+- Configured input mappings for movement, mining, placing
+- Pixel-perfect rendering (texture_filter=0)
+- Main scene: `res://game/main.tscn`
+- Plugin enabled: `terrain2d_plugin`
 
 ---
 
@@ -139,7 +194,48 @@ Create a 2D procedural terrain system combining:
 
 ### 🚧 TO IMPLEMENT
 
-#### 1. Auto-Tiling System (`src/rendering/auto_tiling.*`)
+#### 1. Building Terrain Flattening System
+**Location**: `src/world/world_generator.cpp` in `step3_generate_terrain()`
+
+**Requirements**:
+- Buildings are already placed in step2 with `is_structure_block = true`
+- Each building can have up to 2 terrain alignment markers
+- Terrain generation should detect markers and flatten ground near them
+- Flattening radius: ~5-10 blocks from marker position
+
+**Implementation Plan**:
+```cpp
+// In StructureGenerator
+struct TerrainMarker {
+    Vector2i position;
+    int flatten_radius;  // Blocks to flatten around this point
+};
+
+// Store markers when placing buildings
+std::vector<TerrainMarker> terrain_markers;
+
+// In step3_generate_terrain():
+for (int x = 0; x < WORLD_WIDTH; x++) {
+    float height = generate_terrain_height(x, biome);
+
+    // Check if near a terrain marker
+    for (const auto& marker : structure_generator->get_terrain_markers()) {
+        if (abs(x - marker.position.x) <= marker.flatten_radius) {
+            // Flatten height toward marker's Y level
+            float target_y = marker.position.y;
+            float distance = abs(x - marker.position.x);
+            float blend = 1.0f - (distance / marker.flatten_radius);
+            height = lerp(height, target_y, blend);
+        }
+    }
+
+    generate_column(x, height, biome);
+}
+```
+
+**Status**: Placeholder exists, needs full implementation
+
+#### 2. Auto-Tiling System (`src/rendering/auto_tiling.*`)
 **47-Tile Terraria-Style Blending**
 
 ```cpp
