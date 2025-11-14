@@ -63,9 +63,27 @@ void WorldGenerator::step3_generate_terrain() {
 
         float height = generate_terrain_height(x, biome);
 
-        // Check if near a building - flatten if so
-        // (Building system will set markers)
-        // TODO: Implement terrain flattening near building markers
+        // Check if near terrain flattening markers (from buildings)
+        const auto& markers = structure_generator->get_terrain_markers();
+        for (const auto& marker : markers) {
+            // Calculate horizontal distance (with world wrapping)
+            int dx = abs(x - marker.position.x);
+            if (dx > WORLD_WIDTH / 2) {
+                dx = WORLD_WIDTH - dx;  // Account for world wrap
+            }
+
+            // If within flattening radius
+            if (dx <= marker.flatten_radius) {
+                // Calculate blend factor (1.0 at marker, 0.0 at edge)
+                float distance_ratio = static_cast<float>(dx) / static_cast<float>(marker.flatten_radius);
+                float blend = 1.0f - distance_ratio;  // Smooth falloff
+                blend = blend * blend;  // Square for smoother curve
+
+                // Blend toward marker's Y level
+                float target_height = static_cast<float>(marker.position.y);
+                height = height * (1.0f - blend) + target_height * blend;
+            }
+        }
 
         generate_column(x, height, biome);
     }
@@ -374,6 +392,25 @@ bool StructureGenerator::can_place_structure(const StructureTemplate& structure,
 }
 
 void StructureGenerator::place_structure(const StructureTemplate& structure, Vector2i pos) {
+    // Add terrain flattening markers if building needs flat ground
+    // Max 2 markers per building
+    if (structure.needs_flat_ground && structure.phase == PRE_CAVE) {
+        // Example: For a building at pos with size (width, height)
+        // Place marker at the base center with radius based on width
+        int base_y = pos.y + structure.size.y;  // Bottom of structure
+        int center_x = pos.x + structure.size.x / 2;
+        int flatten_radius = std::max(structure.size.x / 2 + 5, 8);  // At least 8 blocks radius
+
+        add_terrain_marker(Vector2i(center_x, base_y), flatten_radius);
+
+        // Optional: Add second marker for larger buildings
+        if (structure.size.x > 20) {
+            // Left side marker
+            int left_x = pos.x + structure.size.x / 4;
+            add_terrain_marker(Vector2i(left_x, base_y), flatten_radius / 2);
+        }
+    }
+
     // Place structure blocks
     for (int x = 0; x < structure.size.x; x++) {
         for (int y = 0; y < structure.size.y; y++) {
@@ -388,6 +425,7 @@ void StructureGenerator::place_structure(const StructureTemplate& structure, Vec
 
             // Place structure block (if template data exists)
             // TODO: Load from template data
+            // When implemented, mark blocks with is_structure_block = true in BlockDefinition
         }
     }
 

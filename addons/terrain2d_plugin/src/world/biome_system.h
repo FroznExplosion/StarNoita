@@ -5,8 +5,12 @@
 #include "world_constants.h"
 #include <godot_cpp/variant/vector2i.hpp>
 #include <godot_cpp/variant/color.hpp>
+#include <godot_cpp/variant/string.hpp>
 #include <vector>
+#include <unordered_map>
 #include <unordered_set>
+#include <cmath>
+#include <cstdint>
 
 using namespace godot;
 

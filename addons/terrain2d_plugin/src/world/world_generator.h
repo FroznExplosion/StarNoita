@@ -7,6 +7,10 @@
 #include "../core/chunk_manager.h"
 #include "../core/block_registry.h"
 #include <godot_cpp/variant/vector2i.hpp>
+#include <godot_cpp/variant/string.hpp>
+#include <vector>
+#include <cmath>
+#include <cstdint>
 
 using namespace godot;
 
@@ -113,6 +117,15 @@ public:
         std::vector<std::vector<uint16_t>> blocks;
     };
 
+    // Terrain flattening marker (max 2 per building)
+    struct TerrainMarker {
+        Vector2i position;      // World tile position
+        int flatten_radius;     // Blocks to flatten around this point
+
+        TerrainMarker() : position(0, 0), flatten_radius(5) {}
+        TerrainMarker(Vector2i pos, int radius) : position(pos), flatten_radius(radius) {}
+    };
+
 private:
     ChunkManager* chunk_manager;
     BlockRegistry* block_registry;
@@ -121,6 +134,7 @@ private:
 
     std::vector<StructureTemplate> structures;
     std::vector<Vector2i> placed_structures;  // Track placed structure positions
+    std::vector<TerrainMarker> terrain_markers;  // Terrain flattening markers (max 2 per building)
 
 public:
     StructureGenerator(ChunkManager* chunks, BlockRegistry* registry, BiomeSystem* biomes)
@@ -135,7 +149,18 @@ public:
     void register_structure(const StructureTemplate& structure);
 
     // Clear placed structure tracking
-    void clear_placed() { placed_structures.clear(); }
+    void clear_placed() {
+        placed_structures.clear();
+        terrain_markers.clear();
+    }
+
+    // Get terrain markers for terrain generation
+    const std::vector<TerrainMarker>& get_terrain_markers() const { return terrain_markers; }
+
+    // Add a terrain marker (max 2 per building)
+    void add_terrain_marker(Vector2i position, int radius = 5) {
+        terrain_markers.push_back(TerrainMarker(position, radius));
+    }
 
 private:
     // Find valid position for structure

@@ -5,6 +5,7 @@
 #include <godot_cpp/variant/vector2i.hpp>
 #include <godot_cpp/variant/string.hpp>
 #include <godot_cpp/variant/color.hpp>
+#include <cstdint>
 #include <vector>
 
 using namespace godot;

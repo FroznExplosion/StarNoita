@@ -8,6 +8,7 @@
 #include <godot_cpp/variant/vector2i.hpp>
 #include <godot_cpp/variant/rect2i.hpp>
 #include <vector>
+#include <unordered_map>
 
 using namespace godot;
 

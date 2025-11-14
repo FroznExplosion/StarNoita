@@ -2,6 +2,8 @@
 #define WORLD_CONSTANTS_H
 
 #include <godot_cpp/variant/vector2i.hpp>
+#include "block_data.h"
+#include <cstdint>
 
 using namespace godot;
 
