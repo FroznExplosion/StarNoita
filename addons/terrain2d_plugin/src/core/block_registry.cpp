@@ -219,24 +219,36 @@ void BlockRegistry::initialize_default_blocks() {
     torch.breaks_on_fall = true;
     register_block(torch);
 
-    // BACKGROUND STONE (ID 10) - for cave backgrounds
-    BlockDefinition bg_stone;
-    bg_stone.id = 10;
-    bg_stone.name = "background_stone";
-    bg_stone.max_health = 100;
-    bg_stone.damage_reduction = 60;
-    bg_stone.light_opacity = 128;  // Partially transparent
-    bg_stone.can_be_background = true;
-    register_block(bg_stone);
+    // CAVE STONE (ID 10) - inside caves, drops regular stone
+    BlockDefinition cave_stone;
+    cave_stone.id = 10;
+    cave_stone.name = "cave_stone";
+    cave_stone.max_health = 100;
+    cave_stone.damage_reduction = 80;  // Same as stone
+    cave_stone.light_opacity = 255;
+    cave_stone.affected_by_gravity = false;
+    cave_stone.use_autotile = true;
+    cave_stone.can_be_background = false;  // Only in foreground inside caves
+    register_block(cave_stone);
 
-    // CAVE WALL (ID 11) - for cave edge outlines
-    BlockDefinition cave_wall;
-    cave_wall.id = 11;
-    cave_wall.name = "cave_wall";
-    cave_wall.max_health = 100;
-    cave_wall.damage_reduction = 70;
-    cave_wall.light_opacity = 200;
-    cave_wall.use_autotile = true;
-    cave_wall.can_be_background = true;
-    register_block(cave_wall);
+    // More cave variants for different biomes will be added:
+    // MOSSY_STONE (ID 11) - for swamp biome
+    BlockDefinition mossy_stone;
+    mossy_stone.id = 11;
+    mossy_stone.name = "mossy_stone";
+    mossy_stone.max_health = 100;
+    mossy_stone.damage_reduction = 80;
+    mossy_stone.light_opacity = 255;
+    mossy_stone.use_autotile = true;
+    register_block(mossy_stone);
+
+    // MOSSY_CAVE_STONE (ID 12) - cave variant of mossy stone
+    BlockDefinition mossy_cave_stone;
+    mossy_cave_stone.id = 12;
+    mossy_cave_stone.name = "mossy_cave_stone";
+    mossy_cave_stone.max_health = 100;
+    mossy_cave_stone.damage_reduction = 80;
+    mossy_cave_stone.light_opacity = 255;
+    mossy_cave_stone.use_autotile = true;
+    register_block(mossy_cave_stone);
 }

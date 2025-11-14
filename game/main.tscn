@@ -1,0 +1,25 @@
+[gd_scene load_steps=4 format=3 uid="uid://main_scene"]
+
+[ext_resource type="PackedScene" uid="uid://player_scene" path="res://game/player/player.tscn" id="1"]
+[ext_resource type="PackedScene" uid="uid://hud_scene" path="res://game/ui/hud.tscn" id="2"]
+[ext_resource type="Script" path="res://game/world/terrain_controller.gd" id="3"]
+
+[node name="Main" type="Node2D"]
+
+[node name="Camera2D" type="Camera2D" parent="."]
+position = Vector2(0, 0)
+zoom = Vector2(2, 2)
+position_smoothing_enabled = true
+position_smoothing_speed = 5.0
+
+[node name="Terrain2D" type="Node2D" parent="."]
+script = ExtResource("3")
+
+[node name="Player" parent="." instance=ExtResource("1")]
+position = Vector2(0, -5000)
+
+[node name="CanvasLayer" type="CanvasLayer" parent="."]
+
+[node name="HUD" parent="CanvasLayer" instance=ExtResource("2")]
+
+[connection signal="position_changed" from="Player" to="Camera2D" method="set_global_position"]

@@ -6,7 +6,9 @@
 #include "chunk_manager.h"
 #include "block_registry.h"
 #include <godot_cpp/variant/vector2i.hpp>
+#include <godot_cpp/variant/vector2.hpp>
 #include <vector>
+#include <cstdint>
 
 using namespace godot;
 
