@@ -1,0 +1,10 @@
+[configuration]
+entry_symbol = "terrain2d_library_init"
+compatibility_minimum = "4.3"
+reloadable = true
+
+[libraries]
+linux.debug.x86_64 = "bin/libterrain2d.linux.debug.x86_64.so"
+linux.release.x86_64 = "bin/libterrain2d.linux.release.x86_64.so"
+windows.debug.x86_64 = "bin/libterrain2d.windows.debug.x86_64.dll"
+windows.release.x86_64 = "bin/libterrain2d.windows.release.x86_64.dll"

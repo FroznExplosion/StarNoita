@@ -1,0 +1,835 @@
+# 2D Procedural Generation System Documentation
+
+## Universe Architecture Overview
+
+This system implements a Starbound-style universe with multiple planets, persistent outpost hub, and character switching, combined with Terraria-style world layers and Minecraft-style seeded generation.
+
+## 1. Universe Save System
+
+### Save Structure
+```
+Universe_Save_001/
+├── universe.dat           # Universe metadata
+├── outpost/              # Persistent hub area
+│   ├── outpost.world     # Outpost terrain/buildings
+│   ├── storage.dat       # Shared storage
+│   └── ships/            # Docked spaceships
+├── characters/           # All characters in universe
+│   ├── char_001.dat
+│   ├── char_002.dat
+│   └── char_003.dat
+├── planets/              # Generated planets
+│   ├── planet_x123_y456/ # Coordinate-based folders
+│   │   ├── world.dat
+│   │   ├── chunks/
+│   │   └── entities.dat
+│   └── planet_x789_y012/
+└── ships/                # Player ships
+	├── ship_001.dat
+	└── ship_002.dat
+```
+
+### Universe Manager Class
+```cpp
+class UniverseManager {
+private:
+	struct UniverseData {
+		uint64_t seed;          // Master universe seed
+		String name;
+		float play_time;
+		int num_characters;
+		Vector2i outpost_upgrades;
+	};
+	
+	struct CharacterData {
+		String name;
+		int ship_id;
+		Vector2i last_planet;
+		Vector2 last_position;
+		Inventory inventory;
+		Stats stats;
+	};
+	
+public:
+	void create_universe(String name, uint64_t seed);
+	void load_universe(String path);
+	void add_character(CharacterData character);
+	void switch_character(int character_id);
+	void save_universe();
+};
+```
+
+## 2. Planet Generation System
+
+### Planet Properties
+```cpp
+struct PlanetDefinition {
+	// Core properties
+	Vector2i coordinates;      // Universe position (acts as seed)
+	PlanetSize size;          // Small/Medium/Large
+	PlanetType type;          // Forest, Desert, Ocean, etc.
+	int threat_level;         // 1-10 difficulty
+	
+	// Size definitions
+	struct SizeData {
+		int width;            // Blocks wide (wraps)
+		int surface_height;   // Base terrain height
+		int total_height;     // Total world height
+	};
+	
+	// Size presets
+	static constexpr SizeData SMALL  = {3000, 600, 2400};
+	static constexpr SizeData MEDIUM = {6000, 800, 3200};
+	static constexpr SizeData LARGE  = {12000, 1000, 4000};
+};
+```
+
+### World Wrapping System
+```cpp
+class WorldWrapper {
+private:
+	int world_width;
+	Block2D* world_data;
+	
+public:
+	// Seamless wrapping coordinates
+	int wrap_x(int x) {
+		while (x < 0) x += world_width;
+		return x % world_width;
+	}
+	
+	// Get block with wrapping
+	Block2D get_block(int x, int y) {
+		return world_data[wrap_x(x)][y];
+	}
+	
+	// Check if chunk needs duplicate rendering for seamless edge
+	bool needs_edge_rendering(int chunk_x) {
+		int chunk_start = chunk_x * CHUNK_WIDTH;
+		int chunk_end = chunk_start + CHUNK_WIDTH;
+		
+		// Near world wrap point
+		return (chunk_end > world_width - RENDER_BUFFER) ||
+			   (chunk_start < RENDER_BUFFER);
+	}
+	
+	// Generate seamless biome transition at wrap point
+	void generate_wrap_transition() {
+		const int BLEND_WIDTH = 128; // Blocks to blend
+		
+		// Sample biomes at edges
+		Biome left_biome = get_biome(0);
+		Biome right_biome = get_biome(world_width - 1);
+		
+		// Create smooth transition
+		for (int i = 0; i < BLEND_WIDTH; i++) {
+			float t = i / float(BLEND_WIDTH);
+			
+			// Blend terrain height
+			int left_x = world_width - BLEND_WIDTH + i;
+			int right_x = i;
+			
+			float height = lerp(
+				get_terrain_height(left_x),
+				get_terrain_height(right_x),
+				smoothstep(t)
+			);
+			
+			set_terrain_height(left_x, height);
+			set_terrain_height(right_x, height);
+		}
+	}
+};
+```
+
+## 3. World Layer System
+
+### Layer Definitions
+```cpp
+enum WorldLayer {
+	SPACE,          // 1000+ blocks above sea level
+	SKY,            // Sea level to 1000 blocks
+	SURFACE,        // -100 to +100 of sea level
+	UNDERGROUND,    // -100 to -5000 below sea level
+	UNDERWORLD,     // -5000 to -6000 (like Terraria's Hell)
+    DEEP_WORLD      // -6000 to bedrock (-8000)
+};
+
+struct LayerDefinition {
+    String name;
+    int min_height;        // Relative to sea level
+    int max_height;
+    float gravity_modifier;
+    Color ambient_light;
+    
+    // Content generation
+    std::vector<StructureType> allowed_structures;
+    std::vector<OreType> ore_distribution;
+    std::vector<BiomeType> allowed_biomes;
+    std::vector<EnemyType> enemy_spawns;
+};
+
+// Layer configurations
+const LayerDefinition LAYER_DEFINITIONS[] = {
+    // SPACE LAYER (1000+ above sea level)
+    {
+        "Space", 1000, 2000, 0.3f, Color(0.1, 0.1, 0.2),
+        {SPACE_STATION, ASTEROID_FIELD},
+        {STAR_METAL, VOID_CRYSTAL},
+        {ASTEROID, SPACE_VOID},
+        {SPACE_WHALE, VOID_WYRM, STAR_JELLYFISH}
+    },
+    
+    // SKY LAYER (0 to 1000 above sea level)
+    {
+        "Sky", 0, 1000, 0.8f, Color(0.7, 0.8, 1.0),
+        {FLOATING_ISLAND, CLOUD_CASTLE, SKY_SHRINE, AIRSHIP},
+        {CLOUD_ORE, AETHERIUM, SKY_CRYSTAL},
+        {CLOUD, FLOATING_FOREST, CRYSTAL_PEAKS},
+        {HARPY, WYVERN, PHOENIX, SKY_SERPENT}
+    },
+    
+    // SURFACE LAYER (-100 to +100 of sea level)
+    {
+        "Surface", -100, 100, 1.0f, Color(1.0, 1.0, 1.0),
+        {VILLAGE, DUNGEON_ENTRANCE, TEMPLE, CASTLE, FARM},
+        {COPPER, TIN, IRON, LEAD, SILVER},
+        {FOREST, DESERT, SNOW, JUNGLE, SWAMP, PLAINS},
+        {SLIME, ZOMBIE, SKELETON, GOBLIN}
+    },
+    
+    // UNDERGROUND LAYER (-100 to -5000)
+    {
+        "Underground", -100, -5000, 1.0f, Color(0.3, 0.3, 0.4),
+        {MINESHAFT, UNDERGROUND_CABIN, CRYSTAL_CAVE, MUSHROOM_GROVE},
+        {IRON, GOLD, PLATINUM, DIAMOND, MITHRIL},
+        {CAVE, CRYSTAL_CAVERN, UNDERGROUND_JUNGLE, MUSHROOM},
+        {CAVE_SPIDER, BAT, CAVE_TROLL, ROCK_ELEMENTAL}
+    },
+    
+    // UNDERWORLD LAYER (-5000 to -6000)
+    {
+        "Underworld", -5000, -6000, 1.2f, Color(0.8, 0.2, 0.1),
+        {HELL_FORTRESS, DEMON_ALTAR, LAVA_FORGE, OBSIDIAN_TOWER},
+        {HELLSTONE, OBSIDIAN, DEMON_ORE, SOUL_CRYSTAL},
+        {ASH_WASTE, LAVA_OCEAN, BRIMSTONE, DEMON_HIVE},
+        {IMP, DEMON, LAVA_SLIME, BONE_SERPENT}
+    },
+    
+    // DEEP WORLD LAYER (-6000 to -8000)
+    {
+        "Deep World", -6000, -8000, 1.5f, Color(0.1, 0.0, 0.2),
+        {ANCIENT_VAULT, VOID_TEMPLE, CRYSTAL_CORE, ELDER_SHRINE},
+        {ADAMANTITE, VOID_STONE, ANCIENT_ALLOY, DARK_MATTER},
+        {VOID_CAVERN, ANCIENT_RUINS, CRYSTAL_DEPTHS},
+        {VOID_BEAST, ANCIENT_GUARDIAN, SHADOW_WYRM}
+    }
+};
+```
+
+### Height-Based Generation
+```cpp
+class LayerGenerator {
+public:
+    void generate_world_layers(PlanetData* planet) {
+        int sea_level = planet->sea_level;
+        
+        // Generate each layer
+        for (const auto& layer_def : LAYER_DEFINITIONS) {
+            generate_layer(
+                planet,
+                sea_level + layer_def.min_height,
+                sea_level + layer_def.max_height,
+                layer_def
+            );
+        }
+        
+        // Special features
+        generate_floating_islands(planet);
+        generate_underworld_terrain(planet);
+        generate_deep_structures(planet);
+    }
+    
+private:
+    void generate_floating_islands(PlanetData* planet) {
+        // Generate 3-9 floating islands based on world size
+        int num_islands = random_range(3, 9);
+        
+        for (int i = 0; i < num_islands; i++) {
+            FloatingIsland island;
+            island.x = random(planet->width);
+            island.y = random_range(400, 800); // Above sea level
+            island.width = random_range(50, 200);
+            island.has_structure = random() < 0.75f;
+            
+            if (island.has_structure) {
+                island.structure_type = random_choice({
+                    SKYWARE_HOUSE,
+                    CLOUD_TEMPLE,
+                    FLOATING_LAKE
+                });
+            }
+            
+            generate_island(planet, island);
+        }
+    }
+    
+    void generate_underworld_terrain(PlanetData* planet) {
+        // Not just caves - actual terrain like surface but hellish
+        int underworld_top = planet->sea_level - 5000;
+        
+        // Generate inverted mountains (stalactites)
+        for (int x = 0; x < planet->width; x++) {
+            float noise = perlin(x * 0.01f) * 50;
+            int ceiling_height = underworld_top - noise;
+            
+            // Ash and lava terrain
+            generate_hell_terrain(planet, x, ceiling_height);
+        }
+        
+        // Add lava lakes
+        generate_lava_lakes(planet, underworld_top);
+        
+        // Place hell structures
+        place_hell_fortresses(planet);
+    }
+};
+```
+
+## 4. Biome Generation Rules
+
+### Biome Compatibility System
+```cpp
+class BiomeRules {
+private:
+    // Biome incompatibility matrix
+    struct BiomeRule {
+        BiomeType biome;
+        std::vector<BiomeType> cannot_border;  // Cannot be adjacent
+        std::vector<BiomeType> prefers_near;   // Tends to spawn near
+        int min_height;                        // Minimum spawn height
+        int max_height;                        // Maximum spawn height
+        float temperature;                     // Temperature requirement
+        float humidity;                        // Humidity requirement
+    };
+    
+    const BiomeRule BIOME_RULES[] = {
+        {DESERT, {SNOW, TUNDRA, ICE}, {SAVANNA, MESA}, -100, 500, 0.9f, 0.1f},
+        {SNOW, {DESERT, JUNGLE, VOLCANO}, {TUNDRA, ICE}, -100, 1000, 0.1f, 0.3f},
+        {JUNGLE, {SNOW, TUNDRA, DESERT}, {SWAMP, FOREST}, -200, 300, 0.8f, 0.9f},
+        {OCEAN, {}, {BEACH, CORAL_REEF}, -1000, 0, 0.5f, 1.0f},
+        {VOLCANO, {SNOW, ICE}, {ASH_WASTE, OBSIDIAN}, 0, 800, 1.0f, 0.2f},
+        {MUSHROOM, {}, {CAVE, UNDERGROUND_JUNGLE}, -3000, -500, 0.6f, 0.8f},
+        {CORRUPTION, {HALLOW}, {}, -500, 500, 0.4f, 0.4f},
+        {HALLOW, {CORRUPTION, CRIMSON}, {}, -500, 500, 0.6f, 0.6f},
+        {FLOATING_FOREST, {}, {SKY, CLOUD}, 400, 900, 0.5f, 0.5f},
+        {SPACE_VOID, {}, {ASTEROID}, 1000, 2000, 0.0f, 0.0f}
+    };
+    
+public:
+    bool can_place_biome(BiomeType biome, Vector2i pos, PlanetData* planet) {
+        const BiomeRule& rule = get_rule(biome);
+        
+        // Check height constraints
+        int height = get_height_at(pos);
+        if (height < rule.min_height || height > rule.max_height) {
+            return false;
+        }
+        
+        // Check neighboring biomes
+        for (const auto& neighbor : get_adjacent_biomes(pos, planet)) {
+            if (std::find(rule.cannot_border.begin(), 
+                         rule.cannot_border.end(), 
+                         neighbor) != rule.cannot_border.end()) {
+                return false;
+            }
+        }
+        
+        // Check climate
+        float local_temp = get_temperature(pos);
+        float local_humidity = get_humidity(pos);
+        
+        return abs(local_temp - rule.temperature) < 0.3f &&
+               abs(local_humidity - rule.humidity) < 0.3f;
+    }
+    
+    void generate_biome_map(PlanetData* planet) {
+        // Use Voronoi diagram for natural biome shapes
+        std::vector<BiomeSeed> seeds = generate_biome_seeds(planet);
+        
+        // Assign biomes based on rules
+        for (auto& seed : seeds) {
+            seed.biome = select_valid_biome(seed.position, planet);
+        }
+        
+        // Generate biome boundaries with smooth transitions
+        generate_voronoi_biomes(planet, seeds);
+        
+        // Apply biome blending at edges
+        smooth_biome_transitions(planet);
+    }
+};
+```
+
+### Seeded Generation System
+```cpp
+class SeededGenerator {
+private:
+    uint64_t universe_seed;
+    
+    // Generate seed from coordinates
+    uint64_t get_planet_seed(Vector2i coords) {
+        // Combine universe seed with planet coordinates
+        uint64_t seed = universe_seed;
+        seed ^= hash(coords.x) << 32;
+        seed ^= hash(coords.y);
+        return seed;
+    }
+    
+public:
+    PlanetData generate_planet(Vector2i coords) {
+        uint64_t planet_seed = get_planet_seed(coords);
+        RandomGenerator rng(planet_seed);
+        
+        PlanetData planet;
+        planet.seed = planet_seed;
+        planet.coordinates = coords;
+        
+        // Determine planet properties from seed
+        planet.type = select_planet_type(rng);
+        planet.size = select_planet_size(rng);
+        planet.threat_level = calculate_threat_level(coords);
+        
+        // Generate terrain
+        generate_terrain(planet, rng);
+        
+        // Place structures FIRST (like Starbound)
+        place_major_structures(planet, rng);
+        
+        // Then form terrain around structures
+        adapt_terrain_to_structures(planet);
+        
+        // Generate biomes
+        generate_biomes(planet, rng);
+        
+        // Add details
+        populate_world(planet, rng);
+        
+        return planet;
+    }
+    
+    void place_major_structures(PlanetData& planet, RandomGenerator& rng) {
+        // Place structures before terrain details
+        std::vector<Structure> structures;
+        
+        // Determine which structures can spawn
+        for (const auto& structure_type : STRUCTURE_TYPES) {
+            if (can_spawn_on_planet(structure_type, planet)) {
+                int count = rng.range(
+                    structure_type.min_per_world,
+                    structure_type.max_per_world
+                );
+                
+                for (int i = 0; i < count; i++) {
+                    Structure s;
+                    s.type = structure_type;
+                    s.position = find_valid_position(structure_type, planet, rng);
+                    s.variant = rng.range(0, structure_type.num_variants);
+                    structures.push_back(s);
+                    
+                    // Reserve space in terrain
+                    reserve_structure_space(planet, s);
+                }
+            }
+        }
+        
+        planet.structures = structures;
+    }
+    
+    void adapt_terrain_to_structures(PlanetData& planet) {
+        // Modify terrain to accommodate structures
+        for (const auto& structure : planet.structures) {
+            // Flatten ground under buildings
+            if (structure.type.needs_flat_ground) {
+                flatten_terrain(planet, structure.position, structure.size);
+            }
+            
+            // Create basement/foundation if needed
+            if (structure.type.has_basement) {
+                carve_basement(planet, structure);
+            }
+            
+            // Ensure no floating structures
+            add_support_pillars(planet, structure);
+        }
+    }
+};
+```
+
+## 5. Structure Generation System
+
+### Structure-First Generation
+```cpp
+struct StructureDefinition {
+    String name;
+    Vector2i size;
+    int min_spacing;           // Minimum distance between structures
+    WorldLayer preferred_layer;
+    std::vector<BiomeType> allowed_biomes;
+    bool needs_flat_ground;
+    bool has_basement;
+    int rarity;               // 1-100, lower = rarer
+    
+    // Loot and enemies
+    std::vector<LootTable> loot_tables;
+    std::vector<EnemySpawn> enemy_spawns;
+};
+
+const StructureDefinition STRUCTURES[] = {
+    // Surface structures
+    {"Village", {200, 50}, 500, SURFACE, {PLAINS, FOREST, DESERT}, true, false, 30},
+    {"Dungeon", {150, 200}, 1000, SURFACE, {ALL}, false, true, 10},
+    {"Temple", {80, 60}, 800, SURFACE, {JUNGLE, DESERT}, true, true, 15},
+    {"Castle", {300, 100}, 2000, SURFACE, {PLAINS, MOUNTAINS}, true, true, 5},
+    
+    // Sky structures
+    {"Floating Island", {100, 30}, 300, SKY, {ALL}, false, false, 100},
+    {"Sky Temple", {60, 40}, 1000, SKY, {ALL}, false, false, 20},
+    {"Cloud City", {250, 80}, 3000, SKY, {CLOUD}, false, false, 3},
+    
+    // Underground structures
+    {"Mineshaft", {40, 60}, 200, UNDERGROUND, {ALL}, false, false, 40},
+    {"Crystal Cave", {80, 80}, 600, UNDERGROUND, {CRYSTAL_CAVERN}, false, false, 25},
+    {"Underground City", {300, 150}, 2000, UNDERGROUND, {ALL}, false, false, 8},
+    
+    // Underworld structures
+    {"Hell Fortress", {200, 120}, 1500, UNDERWORLD, {ALL}, false, false, 15},
+    {"Demon Temple", {100, 80}, 1000, UNDERWORLD, {ALL}, false, true, 20},
+    
+    // Deep World structures
+    {"Ancient Vault", {150, 100}, 3000, DEEP_WORLD, {ALL}, false, false, 5},
+    {"Elder Shrine", {50, 50}, 500, DEEP_WORLD, {ALL}, false, false, 10}
+};
+
+class StructureGenerator {
+public:
+    void generate_structures(PlanetData* planet) {
+        // Sort structures by priority (larger first)
+        auto sorted_structures = sort_by_size(STRUCTURES);
+        
+        for (const auto& structure_def : sorted_structures) {
+            place_structure(planet, structure_def);
+        }
+    }
+    
+private:
+    void place_structure(PlanetData* planet, const StructureDefinition& def) {
+        // Check if structure can spawn on this planet
+        if (!can_spawn(def, planet)) return;
+        
+        // Determine number to spawn
+        int count = calculate_spawn_count(def, planet);
+        
+        for (int i = 0; i < count; i++) {
+            Vector2i position = find_valid_position(def, planet);
+            
+            if (position != INVALID_POS) {
+                // Reserve space
+                reserve_space(planet, position, def.size);
+                
+                // Generate structure
+                generate_structure_blocks(planet, position, def);
+                
+                // Add to structure list
+                planet->structures.push_back({def, position});
+            }
+        }
+    }
+};
+```
+
+## 6. Persistent Outpost System
+
+### Outpost Generation
+```cpp
+class OutpostManager {
+private:
+    struct OutpostData {
+        Vector2i size = {1000, 500};  // Fixed outpost size
+        std::vector<Building> buildings;
+        std::vector<NPC> merchants;
+        StorageSystem shared_storage;
+    };
+    
+public:
+    void generate_outpost(UniverseData* universe) {
+        OutpostData outpost;
+        
+        // Generate terrain (always the same for consistency)
+        generate_outpost_terrain(outpost);
+        
+        // Place core buildings
+        place_building(outpost, SPAWN_PLATFORM, {500, 250});
+        place_building(outpost, SHIP_DOCK, {200, 280});
+        place_building(outpost, STORAGE_VAULT, {600, 250});
+        place_building(outpost, MERCHANT_PLAZA, {500, 300});
+        place_building(outpost, TELEPORTER_HUB, {400, 250});
+        
+        // Add upgrade slots
+        add_upgrade_areas(outpost);
+        
+        // Spawn NPCs
+        spawn_merchants(outpost);
+        
+        universe->outpost = outpost;
+    }
+    
+    void upgrade_outpost(OutpostData* outpost, UpgradeType upgrade) {
+        switch (upgrade) {
+            case EXPAND_DOCK:
+                expand_ship_dock(outpost);
+                break;
+            case ADD_SHOP:
+                add_merchant_shop(outpost);
+                break;
+            case BUILD_ARENA:
+                construct_battle_arena(outpost);
+                break;
+        }
+    }
+};
+```
+
+## 7. Ship System
+
+### Spaceship Management
+```cpp
+class SpaceshipSystem {
+    struct Spaceship {
+        int id;
+        int owner_character_id;
+        ShipType type;
+        Vector2i interior_size;
+        
+        // Ship components
+        std::vector<Room> rooms;
+        std::vector<System> systems;  // Engine, weapons, shields
+        StorageSystem cargo;
+        
+        // Docked location
+        bool is_docked;
+        Vector2i docked_planet;
+        Vector2 landing_position;
+    };
+    
+public:
+    void create_starter_ship(int character_id) {
+        Spaceship ship;
+        ship.owner_character_id = character_id;
+        ship.type = STARTER_SHUTTLE;
+        ship.interior_size = {20, 10};
+        
+        // Generate basic layout
+        generate_ship_interior(ship);
+        
+        // Add to universe
+        universe->ships.push_back(ship);
+    }
+    
+    void upgrade_ship(Spaceship* ship, ShipUpgrade upgrade) {
+        // Expand ship size and add rooms
+        expand_ship_interior(ship, upgrade.size_increase);
+        add_ship_room(ship, upgrade.new_room);
+    }
+    
+    void board_ship(CharacterData* character, int ship_id) {
+        // Transfer player to ship interior
+        character->current_location = LOCATION_SHIP;
+        character->ship_id = ship_id;
+    }
+};
+```
+
+## 8. Weather and Environmental Effects
+
+### Biome-Specific Weather
+```cpp
+struct WeatherSystem {
+    struct WeatherPattern {
+        WeatherType type;
+        float intensity;
+        float duration;
+        std::vector<BiomeType> occurs_in;
+        
+        // Effects
+        bool creates_puddles;
+        float liquid_accumulation_rate;
+        float evaporation_modifier;
+        bool affects_visibility;
+    };
+    
+    const WeatherPattern WEATHER_TYPES[] = {
+        {RAIN, 0.5f, 300.0f, {FOREST, JUNGLE, SWAMP}, 
+         true, 0.1f, 0.5f, true},
+        
+        {STORM, 0.8f, 180.0f, {OCEAN, JUNGLE, SWAMP}, 
+         true, 0.2f, 0.3f, true},
+        
+        {SNOW, 0.6f, 400.0f, {SNOW_BIOME, TUNDRA, ICE}, 
+         false, 0.05f, 0.1f, true},
+        
+        {SANDSTORM, 0.7f, 240.0f, {DESERT, MESA, WASTELAND}, 
+         false, 0.0f, 2.0f, true},
+        
+        {ASH_STORM, 0.9f, 200.0f, {VOLCANO, ASH_WASTE, UNDERWORLD}, 
+         false, 0.0f, 1.5f, true},
+        
+        {METEOR_SHOWER, 0.3f, 60.0f, {ALL}, 
+         false, 0.0f, 1.0f, false}
+    };
+    
+    void process_weather(PlanetData* planet, float delta_time) {
+        WeatherPattern* current = planet->current_weather;
+        
+        if (current && current->creates_puddles) {
+            // Add water to depressions during rain
+            for (int x = 0; x < planet->width; x++) {
+                if (is_depression(x, get_surface_y(x))) {
+                    add_liquid(x, get_surface_y(x), WATER, 
+                              current->liquid_accumulation_rate * delta_time);
+                }
+            }
+        }
+        
+        // Process evaporation based on biome and weather
+        process_evaporation(planet, current);
+    }
+};
+```
+
+## 9. Optimization for Wrapped Worlds
+
+### Chunk Loading for Wrapped Planets
+```cpp
+class WrappedChunkLoader {
+private:
+    std::unordered_map<int, Chunk2D*> loaded_chunks;
+    int world_width_chunks;
+    
+public:
+    void load_visible_chunks(int camera_x, int view_width) {
+        int left_chunk = (camera_x - view_width/2) / CHUNK_WIDTH;
+        int right_chunk = (camera_x + view_width/2) / CHUNK_WIDTH;
+        
+        // Handle wrapping
+        for (int cx = left_chunk; cx <= right_chunk; cx++) {
+            int wrapped_cx = wrap_chunk_x(cx);
+            
+            if (!is_loaded(wrapped_cx)) {
+                load_chunk(wrapped_cx);
+            }
+            
+            // Check if we need to render chunk twice (at wrap boundary)
+            if (needs_duplicate_render(cx, camera_x, view_width)) {
+                mark_for_duplicate_render(wrapped_cx);
+            }
+        }
+    }
+    
+    int wrap_chunk_x(int cx) {
+        while (cx < 0) cx += world_width_chunks;
+        return cx % world_width_chunks;
+    }
+    
+    bool needs_duplicate_render(int cx, int cam_x, int view_w) {
+        // Chunk appears on both sides of screen due to wrapping
+        int chunk_world_x = cx * CHUNK_WIDTH;
+        int world_width = world_width_chunks * CHUNK_WIDTH;
+        
+        // Check if chunk is visible on wrapped edge
+        if (chunk_world_x < cam_x - view_w/2) {
+            // Check wrapped position
+            return (chunk_world_x + world_width) < cam_x + view_w/2;
+        }
+        if (chunk_world_x > cam_x + view_w/2) {
+            // Check wrapped position
+            return (chunk_world_x - world_width) > cam_x - view_w/2;
+        }
+        
+        return false;
+    }
+};
+```
+
+## 10. Integration Example
+
+### Complete World Generation Pipeline
+```cpp
+class WorldGenerationPipeline {
+public:
+    PlanetData generate_complete_planet(Vector2i coords, UniverseData* universe) {
+        // 1. Initialize planet from seed
+        uint64_t seed = calculate_seed(coords, universe->seed);
+        PlanetData planet(seed, coords);
+        
+        // 2. Determine basic properties
+        planet.type = determine_planet_type(seed);
+        planet.size = determine_planet_size(seed);
+        planet.threat = calculate_threat_level(coords);
+        
+        // 3. Generate height map (basic terrain shape)
+        generate_base_terrain(planet);
+        
+        // 4. Place major structures FIRST
+        place_all_structures(planet);
+        
+        // 5. Adapt terrain to structures
+        modify_terrain_for_structures(planet);
+        
+        // 6. Generate biomes with rules
+        generate_biome_layout(planet);
+        
+        // 7. Add layer-specific content
+        populate_world_layers(planet);
+        
+        // 8. Generate floating islands
+        generate_floating_islands(planet);
+        
+        // 9. Create underworld terrain
+        generate_underworld(planet);
+        
+        // 10. Add caves and liquids
+        carve_cave_systems(planet);
+        fill_liquid_bodies(planet);
+        
+        // 11. Place vegetation and decoration
+        decorate_world(planet);
+        
+        // 12. Ensure seamless wrapping
+        create_wrap_transition(planet);
+        
+        // 13. Calculate lighting
+        calculate_initial_lighting(planet);
+        
+        // 14. Spawn initial entities
+        spawn_world_entities(planet);
+        
+        return planet;
+    }
+};
+```
+
+## Key Features Summary
+
+1. **Universe Saves**: Multiple characters per universe with shared outpost
+2. **Wrapped Planets**: Seamless horizontal wrapping with biome continuation
+3. **Layer System**: 6 distinct height layers with unique content
+4. **Structure-First**: Buildings placed before terrain adapts to them
+5. **Biome Rules**: Incompatibility system prevents unrealistic neighbors
+6. **Weather Effects**: Rain creates puddles, affects evaporation
+7. **Floating Islands**: 3-9 per world at 400-800 blocks high
+8. **Persistent Hub**: Outpost shared between all characters
+9. **Ship System**: Upgradeable spaceships as mobile bases
+10. **Seeded Generation**: Reproducible worlds from coordinates
+
+This system combines the best aspects of Terraria's vertical progression, Starbound's universe exploration, and Minecraft's structured generation to create a rich 2D procedural world system.
